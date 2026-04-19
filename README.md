@@ -55,21 +55,32 @@ vat_bot/
 └── README.md
 ```
 
-## Local setup
+## Quick deploy (office PC)
+
+```bash
+git clone https://github.com/TashkentFreedom250/vat-bot.git
+cd vat-bot
+pip install -r requirements.txt
+# copy your .env file across (it has TELEGRAM_BOT_TOKEN, MONGODB_URI, etc.)
+python -m src.bot
+```
+
+> **Important:** This bot must run on a machine physically located in Uzbekistan.
+> `ofd.soliq.uz` (the Uzbekistan tax authority) geo-blocks all cloud provider IPs (AWS, Railway, Render, Fly.io, etc.).
+> It only responds to Uzbekistan ISP IPs. Running it on an office PC in Tashkent works perfectly.
+
+## Local setup (first time)
 
 ```bash
 # 1. Clone and enter the project
-cd vat_bot
+git clone https://github.com/TashkentFreedom250/vat-bot.git
+cd vat-bot
 
 # 2. Install system deps (for pyzbar and opencv)
-# macOS:
-brew install zbar
 # Ubuntu/Debian:
 sudo apt-get install libzbar0 libgl1
 
 # 3. Python deps
-python3.11 -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
 
 # 4. Configure environment
@@ -94,32 +105,13 @@ Since you already know MongoDB, the easiest free path:
 3. Network Access → allow `0.0.0.0/0` (or Railway's IPs)
 4. Copy the connection string into `MONGODB_URI` in `.env`
 
-## Deploying to Railway (~$5/month)
+## Cloud deployment
 
-Railway is essentially the modern Heroku and will feel very familiar to you.
-
-1. Push this project to GitHub.
-2. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub repo**.
-3. Select the repo. Railway detects the `Dockerfile` automatically.
-4. In **Variables**, add:
-   - `TELEGRAM_BOT_TOKEN`
-   - `MONGODB_URI`
-   - `MONGODB_DB` (e.g. `vat_bot`)
-5. Click **Deploy**. Done.
-
-Railway's Hobby plan is **$5/month** and includes $5 of usage — this bot will comfortably fit.
-
-### Alternative: Fly.io
-
-```bash
-fly launch              # Detects Dockerfile
-fly secrets set TELEGRAM_BOT_TOKEN=... MONGODB_URI=...
-fly deploy
-```
-
-### Alternative: Render
-
-Render has a free tier for background workers. Use the `Dockerfile` build type.
+> **Not recommended** — `ofd.soliq.uz` geo-blocks all cloud provider IPs (AWS, Railway, Render, Fly.io, Cloudflare).
+> Requests time out or return HTTP 522. Run the bot on a PC inside Uzbekistan instead.
+>
+> If you later get a Uzbekistan-based VPS (e.g. Comnet.uz, Uztelecom hosting, ~$5–10/month),
+> it will work fine there too — just clone and run as above.
 
 ## How the soliq.uz scraper works
 
