@@ -32,7 +32,7 @@ from telegram.ext import (
     filters,
 )
 
-from . import config, db, exporter, receipt_image, soliq
+from . import config, db, exporter, receipt_image, receipt_ocr, soliq
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -75,6 +75,35 @@ def _start_health_server() -> None:
 
 async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception while processing an update.", exc_info=ctx.error)
+
+
+def _display_vendor(doc: dict) -> str:
+    return doc.get("display_vendor") or doc.get("printed_vendor") or doc.get("vendor") or ""
+
+
+def _format_ocr_preview(preview: dict, intro: str = "I couldn't verify the QR code, but OCR read this from the receipt:") -> str:
+    lines = [
+        intro,
+        "",
+    ]
+    if preview.get("vendor"):
+        lines.append(f"Vendor: {preview['vendor']}")
+    if preview.get("date"):
+        lines.append(f"Date: {preview['date']}")
+    if preview.get("receipt_number"):
+        lines.append(f"Receipt #: {preview['receipt_number']}")
+    if preview.get("total_amount") is not None:
+        lines.append(f"Total: {preview['total_amount']:,.2f} UZS")
+    if preview.get("vat_hint"):
+        lines.append(f"QQS: {preview['vat_hint']}")
+    lines.extend(
+        [
+            "",
+            "This preview is not verified and was not saved.",
+            "Please resend the image as a file for a verified import.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 # ---------- Commands ----------
@@ -122,7 +151,7 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         vat = float(r.get("vat_amount") or 0)
         total_vat += vat
         lines.append(
-            f"{i}. {r.get('date', '?')} - {r.get('vendor', '?')[:25]} - "
+            f"{i}. {r.get('date', '?')} - {_display_vendor(r)[:25] or '?'} - "
             f"VAT: {vat:,.2f} UZS"
         )
     lines.append(f"\nTotal VAT: {total_vat:,.2f} UZS")
@@ -262,6 +291,16 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("QR decode failed")
 
     if not qr_url:
+        preview = {}
+        try:
+            preview = await loop.run_in_executor(
+                None, receipt_ocr.extract_receipt_preview, cropped_bytes
+            )
+        except Exception:
+            logger.exception("OCR preview failed")
+        if preview:
+            await status.edit_text(_format_ocr_preview(preview))
+            return
         await status.edit_text(
             "Could not read the QR code - the photo resolution is too low.\n\n"
             "Please resend as a file (not a photo):\n"
@@ -274,6 +313,21 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     data = await soliq.fetch_receipt_data(qr_url)
     if not data:
+        preview = {}
+        try:
+            preview = await loop.run_in_executor(
+                None, receipt_ocr.extract_receipt_preview, cropped_bytes
+            )
+        except Exception:
+            logger.exception("OCR preview after soliq failure failed")
+        if preview:
+            await status.edit_text(
+                _format_ocr_preview(
+                    preview,
+                    intro="I read the QR code but couldn't verify the receipt on soliq.uz. OCR read this from the receipt:",
+                )
+            )
+            return
         await status.edit_text(
             "I read the QR code but could not fetch data from soliq.uz "
             "(the page may be down, or this QR is not a soliq.uz fiscal link).\n"
@@ -281,12 +335,24 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
+    printed_vendor = None
+    try:
+        printed_vendor = await loop.run_in_executor(
+            None, receipt_ocr.extract_printed_vendor, cropped_bytes
+        )
+    except Exception:
+        logger.exception("Printed vendor OCR failed")
+
+    display_vendor = printed_vendor or data.get("vendor", "")
+
     file_id = await db.save_image(uid, cropped_bytes, f"receipt_{uid}.png")
     receipt_doc = {
         "telegram_id": uid,
         "image_file_id": file_id,
         "date": data.get("date", ""),
         "vendor": data.get("vendor", ""),
+        "printed_vendor": printed_vendor or "",
+        "display_vendor": display_vendor,
         "receipt_number": data.get("receipt_number", ""),
         "vat_amount": data.get("vat_amount", 0.0),
         "total_amount": data.get("total_amount", 0.0),
@@ -303,11 +369,12 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     count = await db.count_receipts(uid)
     await status.edit_text(
         f"Receipt added (#{count})\n\n"
-        f"Vendor: {data.get('vendor', '-')}\n"
+        f"Vendor: {display_vendor or '-'}\n"
         f"Date: {data.get('date', '-')}\n"
         f"Receipt #: {data.get('receipt_number', '-')}\n"
         f"Total: {data.get('total_amount', 0):,.2f} UZS\n"
-        f"VAT: {data.get('vat_amount', 0):,.2f} UZS"
+        f"VAT: {data.get('vat_amount', 0):,.2f} UZS\n"
+        "Verified tax data source: soliq.uz"
     )
 
 

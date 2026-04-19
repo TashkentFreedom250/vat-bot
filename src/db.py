@@ -5,6 +5,7 @@ Collections:
   - users: { telegram_id, name, created_at }
   - receipts: {
         telegram_id, image_file_id (GridFS), date, vendor,
+        printed_vendor, display_vendor,
         receipt_number, vat_amount, total_amount,
         soliq_url, raw_qr, created_at
     }

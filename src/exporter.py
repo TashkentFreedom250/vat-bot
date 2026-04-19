@@ -30,6 +30,10 @@ PER_SHEET_TOTAL_ROW = 38  # Row with "Total:" at end of each table
 PER_SHEET_TOTAL_COL = "E"
 
 
+def _display_vendor(doc: dict) -> str:
+    return doc.get("display_vendor") or doc.get("printed_vendor") or doc.get("vendor") or ""
+
+
 def _find_data_start(ws) -> int:
     """Find the row where numbered data starts (cell A = 1)."""
     for row in range(1, 50):
@@ -82,7 +86,7 @@ async def build_xlsx(telegram_id: int, employee_name: str, output_path: Path) ->
             row = data_start + i
             # Column A (#) is already filled in the template; leave it.
             ws.cell(row=row, column=2, value=r.get("date", ""))
-            ws.cell(row=row, column=3, value=r.get("vendor", ""))
+            ws.cell(row=row, column=3, value=_display_vendor(r))
             ws.cell(row=row, column=4, value=r.get("receipt_number", ""))
             ws.cell(row=row, column=5, value=r.get("vat_amount", 0) or 0)
 
@@ -126,7 +130,7 @@ async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> 
             c.setFont("Helvetica", 9)
         c.drawString(margin, y, str(i))
         c.drawString(margin + 10 * mm, y, str(r.get("date", "") or ""))
-        vendor = (r.get("vendor", "") or "")[:32]
+        vendor = _display_vendor(r)[:32]
         c.drawString(margin + 35 * mm, y, vendor)
         c.drawString(margin + 100 * mm, y, str(r.get("receipt_number", "") or "")[:18])
         vat = float(r.get("vat_amount") or 0)
@@ -148,7 +152,7 @@ async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> 
         c.drawString(margin, height - margin, f"Receipt #{i}")
         c.setFont("Helvetica", 10)
         c.drawString(margin, height - margin - 6 * mm,
-                     f"{r.get('date','')}  |  {r.get('vendor','')}  |  VAT: {float(r.get('vat_amount') or 0):,.2f} UZS")
+                     f"{r.get('date','')}  |  {_display_vendor(r)}  |  VAT: {float(r.get('vat_amount') or 0):,.2f} UZS")
 
         # Fit image to page while preserving aspect ratio
         try:
