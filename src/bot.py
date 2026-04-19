@@ -140,6 +140,7 @@ async def _save_verified_receipt(
     source_image_bytes: bytes,
     qr_url: str,
     loop: asyncio.AbstractEventLoop,
+    qr_image_bytes: bytes | None = None,
 ) -> tuple[str, bool]:
     data = await soliq.fetch_receipt_data(qr_url)
     if not data:
@@ -160,9 +161,18 @@ async def _save_verified_receipt(
 
     display_vendor = data.get("vendor", "") or printed_vendor or ""
     file_id = await db.save_image(uid, source_image_bytes, f"receipt_{uid}.png")
+
+    qr_file_id = None
+    if qr_image_bytes:
+        try:
+            qr_file_id = await db.save_image(uid, qr_image_bytes, f"qr_{uid}.png")
+        except Exception:
+            logger.exception("Failed to save QR close-up image")
+
     receipt_doc = {
         "telegram_id": uid,
         "image_file_id": file_id,
+        "qr_image_file_id": qr_file_id,
         "date": data.get("date", ""),
         "vendor": data.get("vendor", ""),
         "printed_vendor": printed_vendor or "",
@@ -410,6 +420,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             source_image_bytes=pending_image_bytes,
             qr_url=qr_url,
             loop=loop,
+            qr_image_bytes=cropped_bytes,
         )
         await db.delete_pending_receipt(uid)
         if saved:

@@ -101,6 +101,58 @@ async def build_xlsx(telegram_id: int, employee_name: str, output_path: Path) ->
     return output_path
 
 
+def _draw_pil(c, pil_img: "Image.Image", x: float, y: float, max_w: float, max_h: float) -> None:
+    """Draw a PIL image fitted into (max_w × max_h) box with origin at (x, y)."""
+    from reportlab.lib.utils import ImageReader
+    iw, ih = pil_img.size
+    ratio = min(max_w / iw, max_h / ih)
+    dw, dh = iw * ratio, ih * ratio
+    buf = BytesIO()
+    pil_img.save(buf, format="PNG")
+    buf.seek(0)
+    c.drawImage(ImageReader(buf), x, y, width=dw, height=dh, mask="auto")
+
+
+def _draw_receipt_images(
+    c,
+    img_bytes: bytes,
+    qr_bytes: "bytes | None",
+    x: float,
+    y: float,
+    max_w: float,
+    max_h: float,
+) -> None:
+    """
+    Render receipt image(s) into the bounding box.
+
+    • If a QR close-up is provided (two-photo flow): receipt on left ⅔, QR on right ⅓.
+    • If the receipt alone is very tall (aspect ratio > 2.2): split top/bottom halves
+      side by side so they fill the page width instead of shrinking to a thin strip.
+    • Otherwise: single image fitted to the full box.
+    """
+    gap = 4 * mm
+    pil_main = Image.open(BytesIO(img_bytes)).convert("RGB")
+    iw, ih = pil_main.size
+
+    if qr_bytes:
+        # Two-photo flow: receipt (⅔ width) + QR close-up (⅓ width)
+        receipt_w = (max_w - gap) * 2 / 3
+        qr_w = max_w - gap - receipt_w
+        _draw_pil(c, pil_main, x, y, receipt_w, max_h)
+        pil_qr = Image.open(BytesIO(qr_bytes)).convert("RGB")
+        _draw_pil(c, pil_qr, x + receipt_w + gap, y, qr_w, max_h)
+    elif ih / iw > (max_h / max_w) * 1.5:
+        # Very tall receipt: split into top and bottom halves, show side by side
+        half = ih // 2
+        top_half = pil_main.crop((0, 0, iw, half))
+        bot_half = pil_main.crop((0, half, iw, ih))
+        col_w = (max_w - gap) / 2
+        _draw_pil(c, top_half, x, y, col_w, max_h)
+        _draw_pil(c, bot_half, x + col_w + gap, y, col_w, max_h)
+    else:
+        _draw_pil(c, pil_main, x, y, max_w, max_h)
+
+
 async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> Path:
     """
     Generate a PDF with one receipt image per page, plus a header summary.
@@ -145,6 +197,8 @@ async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> 
         y -= 5 * mm
 
     # --- One page per receipt image ---
+    from reportlab.lib.utils import ImageReader
+
     for i, r in enumerate(receipts, 1):
         file_id = r.get("image_file_id")
         if not file_id:
@@ -154,26 +208,27 @@ async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> 
         except Exception:
             continue
 
+        qr_bytes = None
+        if r.get("qr_image_file_id"):
+            try:
+                qr_bytes = await db.get_image(r["qr_image_file_id"])
+            except Exception:
+                pass
+
         c.showPage()
         c.setFont("Helvetica-Bold", 12)
         c.drawString(margin, height - margin, f"Receipt #{i}")
         c.setFont("Helvetica", 10)
-        c.drawString(margin, height - margin - 6 * mm,
-                     f"{r.get('date','')}  |  {_display_vendor(r)}  |  VAT: {float(r.get('vat_amount') or 0):,.2f} UZS")
+        c.drawString(
+            margin, height - margin - 6 * mm,
+            f"{r.get('date','')}  |  {_display_vendor(r)}  |  VAT: {float(r.get('vat_amount') or 0):,.2f} UZS",
+        )
 
-        # Fit image to page while preserving aspect ratio
+        max_w = width - 2 * margin
+        max_h = height - 2 * margin - 15 * mm
+
         try:
-            pil = Image.open(BytesIO(img_bytes))
-            iw, ih = pil.size
-            max_w = width - 2 * margin
-            max_h = height - 2 * margin - 15 * mm
-            ratio = min(max_w / iw, max_h / ih)
-            dw, dh = iw * ratio, ih * ratio
-            # ReportLab needs a file path or ImageReader
-            from reportlab.lib.utils import ImageReader
-            img_reader = ImageReader(BytesIO(img_bytes))
-            c.drawImage(img_reader, margin, margin,
-                        width=dw, height=dh, preserveAspectRatio=True, mask="auto")
+            _draw_receipt_images(c, img_bytes, qr_bytes, margin, margin, max_w, max_h)
         except Exception:
             c.setFont("Helvetica-Oblique", 10)
             c.drawString(margin, height / 2, "[Image could not be rendered]")

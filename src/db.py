@@ -162,16 +162,18 @@ async def count_receipts(telegram_id: int) -> int:
 
 async def delete_all_receipts(telegram_id: int) -> int:
     """Delete all of a user's receipts AND their GridFS images. Returns count."""
+    from bson import ObjectId
     db = get_db()
     fs = get_fs()
     receipts = await list_receipts(telegram_id)
     for r in receipts:
-        if r.get("image_file_id"):
-            try:
-                from bson import ObjectId
-                await fs.delete(ObjectId(r["image_file_id"]))
-            except Exception:
-                pass
+        for field in ("image_file_id", "qr_image_file_id"):
+            fid = r.get(field)
+            if fid:
+                try:
+                    await fs.delete(ObjectId(fid))
+                except Exception:
+                    pass
     result = await db.receipts.delete_many({"telegram_id": telegram_id})
     return result.deleted_count
 
@@ -190,14 +192,15 @@ async def cleanup_orphaned_images() -> int:
     fs = get_fs()
     referenced: set[ObjectId] = set()
 
-    async for rec in db.receipts.find({}, {"image_file_id": 1}):
-        file_id = rec.get("image_file_id")
-        if not file_id:
-            continue
-        try:
-            referenced.add(ObjectId(file_id))
-        except Exception:
-            continue
+    async for rec in db.receipts.find({}, {"image_file_id": 1, "qr_image_file_id": 1}):
+        for field in ("image_file_id", "qr_image_file_id"):
+            file_id = rec.get(field)
+            if not file_id:
+                continue
+            try:
+                referenced.add(ObjectId(file_id))
+            except Exception:
+                continue
 
     async for rec in db.pending_receipts.find({}, {"image_file_id": 1}):
         file_id = rec.get("image_file_id")
