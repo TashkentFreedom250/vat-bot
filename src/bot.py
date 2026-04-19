@@ -158,7 +158,7 @@ async def _save_verified_receipt(
     except Exception:
         logger.exception("Printed vendor OCR failed")
 
-    display_vendor = printed_vendor or data.get("vendor", "")
+    display_vendor = data.get("vendor", "") or printed_vendor or ""
     file_id = await db.save_image(uid, source_image_bytes, f"receipt_{uid}.png")
     receipt_doc = {
         "telegram_id": uid,

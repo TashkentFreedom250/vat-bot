@@ -278,9 +278,14 @@ def _extract_vendor_from_table(soup: BeautifulSoup) -> str:
 
 
 def _extract_vendor(soup: BeautifulSoup, text: str) -> str:
-    table_vendor = _extract_vendor_from_table(soup)
-    if table_vendor:
-        return table_vendor
+    # soliq.uz puts the company name in a bold <h3> — check this first
+    # (it's the second line: "Savdo cheki/Sotuv" is the first h3, company is the second)
+    h3_tags = soup.find_all("h3")
+    for h3 in h3_tags:
+        raw = h3.get_text(strip=True)
+        name = _clean_vendor_candidate(raw)
+        if _is_vendor_candidate(name) and len(name) < 120:
+            return name
 
     # Try common class names used on soliq pages
     for selector in [".company-name", ".seller-name", ".title", "h1", "h2"]:
@@ -289,6 +294,10 @@ def _extract_vendor(soup: BeautifulSoup, text: str) -> str:
             name = _clean_vendor_candidate(el.get_text(strip=True))
             if _is_vendor_candidate(name) and len(name) < 120:
                 return name
+
+    table_vendor = _extract_vendor_from_table(soup)
+    if table_vendor:
+        return table_vendor
     # Heuristic: first non-empty line that isn't a URL or just a number
     for line in text.splitlines():
         line = _clean_vendor_candidate(line.strip())
