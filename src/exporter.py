@@ -141,8 +141,8 @@ def _draw_receipt_images(
         _draw_pil(c, pil_main, x, y, receipt_w, max_h)
         pil_qr = Image.open(BytesIO(qr_bytes)).convert("RGB")
         _draw_pil(c, pil_qr, x + receipt_w + gap, y, qr_w, max_h)
-    elif ih / iw > (max_h / max_w) * 1.5:
-        # Very tall receipt: split into top and bottom halves, show side by side
+    elif ih / iw > (max_h / max_w) * 1.0:
+        # Receipt taller than the page box: split top/bottom halves side by side
         half = ih // 2
         top_half = pil_main.crop((0, 0, iw, half))
         bot_half = pil_main.crop((0, half, iw, ih))

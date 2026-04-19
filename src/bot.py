@@ -398,9 +398,10 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not qr_url:
             await status.edit_text(
                 "Sorry, I still couldn't read the QR code.\n\n"
-                "Please take a clear close-up of just the QR code and send it here.\n"
-                "I will use it to finish your previous receipt, and I won't keep the QR-only photo.\n\n"
-                "If you want to abandon that receipt, send /cancel_pending."
+                "You can:\n"
+                "• Try another close-up photo of the QR code\n"
+                "• Paste the soliq.uz link — your phone's camera app may have already decoded it\n"
+                "• /cancel_pending to discard this receipt"
             )
             return
 
@@ -462,9 +463,11 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await db.save_pending_receipt(uid, cropped_bytes, file_name)
         await status.edit_text(
             "Sorry, I couldn't read the QR code from this receipt.\n\n"
-            "Please take a clear close-up photo of just the QR code and send it here.\n"
-            "I will use that QR image to finish this receipt, and I won't keep the QR-only photo.\n\n"
-            "For best results, send the close-up as a file instead of a compressed photo."
+            "You can:\n"
+            "• Send a clear close-up photo of just the QR code\n"
+            "• Paste the soliq.uz link — your phone's camera app may have already scanned it\n"
+            "• /cancel_pending to discard this receipt\n\n"
+            "Close-up tip: send as a file (not a compressed photo) for best results."
         )
         return
 
@@ -475,6 +478,56 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         qr_url=qr_url,
         loop=loop,
     )
+    await status.edit_text(message)
+
+
+async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Accept a pasted soliq.uz URL to complete a pending receipt."""
+    uid = update.effective_user.id
+    text = (update.message.text or "").strip()
+
+    pending = await db.get_pending_receipt(uid)
+    if not pending:
+        return
+
+    if "soliq.uz" not in text.lower():
+        await update.message.reply_text(
+            "I'm waiting for:\n"
+            "• A close-up photo of the QR code\n"
+            "• The soliq.uz link (paste from your phone's camera)\n"
+            "• /cancel_pending to discard this receipt"
+        )
+        return
+
+    pending_image_id = pending.get("image_file_id")
+    if not pending_image_id:
+        await db.delete_pending_receipt(uid)
+        await update.message.reply_text(
+            "The pending receipt expired. Please send the full receipt again."
+        )
+        return
+
+    status = await update.message.reply_text("Link received. Fetching verified data from soliq.uz...")
+    try:
+        pending_image_bytes = await db.get_image(pending_image_id)
+    except Exception:
+        logger.exception("Failed to load pending receipt image")
+        await db.delete_pending_receipt(uid)
+        await status.edit_text(
+            "I lost the earlier receipt image. Please send the full receipt again."
+        )
+        return
+
+    loop = asyncio.get_event_loop()
+    message, saved = await _save_verified_receipt(
+        uid=uid,
+        source_image_bytes=pending_image_bytes,
+        qr_url=text,
+        loop=loop,
+    )
+    await db.delete_pending_receipt(uid)
+    if saved:
+        message += "\n\nReceipt completed using the link you pasted."
     await status.edit_text(message)
 
 
@@ -534,6 +587,7 @@ def main() -> None:
 
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Bot starting...")
     try:
