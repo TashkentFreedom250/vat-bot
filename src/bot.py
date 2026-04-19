@@ -41,6 +41,7 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("vat_bot")
+SAVE_DEBUG_IMAGES = os.getenv("SAVE_DEBUG_IMAGES", "").lower() in {"1", "true", "yes"}
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -215,21 +216,23 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await status.edit_text(f"Could not download the image: {e}")
         return
 
-    debug_dir = Path("debug_images")
-    debug_dir.mkdir(exist_ok=True)
+    debug_dir = None
     debug_id = uuid.uuid4().hex[:6]
-    ext = (
-        ".heic"
-        if (
-            msg.document
-            and msg.document.file_name
-            and msg.document.file_name.lower().endswith((".heic", ".heif"))
+    if SAVE_DEBUG_IMAGES:
+        debug_dir = Path("debug_images")
+        debug_dir.mkdir(exist_ok=True)
+        ext = (
+            ".heic"
+            if (
+                msg.document
+                and msg.document.file_name
+                and msg.document.file_name.lower().endswith((".heic", ".heif"))
+            )
+            else ".jpg"
         )
-        else ".jpg"
-    )
-    raw_path = debug_dir / f"raw_{uid}_{debug_id}{ext}"
-    raw_path.write_bytes(image_bytes)
-    logger.info("Saved raw image: %s (%s bytes)", raw_path, len(image_bytes))
+        raw_path = debug_dir / f"raw_{uid}_{debug_id}{ext}"
+        raw_path.write_bytes(image_bytes)
+        logger.info("Saved raw image: %s (%s bytes)", raw_path, len(image_bytes))
 
     loop = asyncio.get_running_loop()
 
@@ -237,7 +240,8 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         cropped_bytes = await loop.run_in_executor(
             None, receipt_image.auto_crop_receipt, image_bytes
         )
-        (debug_dir / f"crop_{uid}_{debug_id}.png").write_bytes(cropped_bytes)
+        if debug_dir is not None:
+            (debug_dir / f"crop_{uid}_{debug_id}.png").write_bytes(cropped_bytes)
         logger.info("Cropped image: %s bytes", len(cropped_bytes))
     except Exception:
         logger.exception("Crop failed")

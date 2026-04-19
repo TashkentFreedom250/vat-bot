@@ -4,16 +4,17 @@ Receipt image processing:
   - Detect & decode the soliq.uz QR code
 """
 from io import BytesIO
-from typing import Optional, Tuple
+from typing import Optional
 
 import cv2
 import numpy as np
 import zxingcpp
 from PIL import Image
 from pillow_heif import register_heif_opener
-from pyzbar.pyzbar import decode as pyzbar_decode
 
 register_heif_opener()
+
+_QR_DETECTOR = cv2.QRCodeDetector()
 
 
 def _to_cv(image_bytes: bytes) -> np.ndarray:
@@ -128,22 +129,168 @@ def _to_png_bytes(cv_img: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
-def _decode_image(img_bgr: np.ndarray) -> list[str]:
-    """Try zxing-cpp (primary) then pyzbar (fallback). Returns list of decoded strings."""
-    results = []
-    pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-    for r in zxingcpp.read_barcodes(pil):
-        if r.text and r.text not in results:
-            results.append(r.text)
-    if not results:
-        for r in pyzbar_decode(img_bgr):
-            try:
-                payload = r.data.decode("utf-8", errors="ignore")
-                if payload and payload not in results:
-                    results.append(payload)
-            except Exception:
-                pass
+def _normalize_payload(text: str) -> str:
+    return " ".join(str(text).strip().split())
+
+
+def _append_unique(found: list[str], values: list[str]) -> None:
+    for value in values:
+        normalized = _normalize_payload(value)
+        if normalized and normalized not in found:
+            found.append(normalized)
+
+
+def _with_border(img: np.ndarray, size: int = 24) -> np.ndarray:
+    value = 255 if img.ndim == 2 else (255, 255, 255)
+    return cv2.copyMakeBorder(
+        img, size, size, size, size, cv2.BORDER_CONSTANT, value=value
+    )
+
+
+def _resize_variant(img: np.ndarray, scale: int, interpolation: int) -> np.ndarray:
+    h, w = img.shape[:2]
+    return cv2.resize(img, (w * scale, h * scale), interpolation=interpolation)
+
+
+def _downscale_for_decode(img: np.ndarray, max_dim: int = 1800) -> np.ndarray:
+    h, w = img.shape[:2]
+    current_max = max(h, w)
+    if current_max <= max_dim:
+        return img
+    scale = max_dim / current_max
+    return cv2.resize(
+        img,
+        (max(1, int(w * scale)), max(1, int(h * scale))),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+def _decode_with_opencv(img: np.ndarray) -> list[str]:
+    results: list[str] = []
+    try:
+        data, _, _ = _QR_DETECTOR.detectAndDecode(img)
+        if data:
+            results.append(data)
+    except Exception:
+        pass
+
+    try:
+        ok, infos, _, _ = _QR_DETECTOR.detectAndDecodeMulti(img)
+        if ok:
+            _append_unique(results, [info for info in infos if info])
+    except Exception:
+        pass
+
+    try:
+        data, _, _ = _QR_DETECTOR.detectAndDecodeCurved(img)
+        if data:
+            _append_unique(results, [data])
+    except Exception:
+        pass
     return results
+
+
+def _decode_with_zxing(img: np.ndarray) -> list[str]:
+    results: list[str] = []
+    for binarizer in (
+        zxingcpp.Binarizer.LocalAverage,
+        zxingcpp.Binarizer.GlobalHistogram,
+    ):
+        try:
+            decoded = zxingcpp.read_barcodes(
+                img,
+                formats=zxingcpp.BarcodeFormat.QRCode,
+                try_rotate=True,
+                try_downscale=False,
+                try_invert=True,
+                binarizer=binarizer,
+            )
+        except Exception:
+            continue
+        _append_unique(results, [barcode.text for barcode in decoded if barcode.text])
+    return results
+
+
+def _decode_image(img: np.ndarray) -> list[str]:
+    """Try several QR decoders and return unique payloads."""
+    results = []
+    _append_unique(results, _decode_with_opencv(img))
+    _append_unique(results, _decode_with_zxing(img))
+    return results
+
+
+def _candidate_regions(img: np.ndarray, aggressive: bool) -> list[np.ndarray]:
+    h, w = img.shape[:2]
+    regions = [img]
+    candidates = (
+        [
+            img[int(h * 0.45):, :],
+            img[int(h * 0.60):, :],
+            img[h // 2:, :w // 2],
+            img[h // 2:, w // 2:],
+        ]
+        if not aggressive
+        else [
+            img[int(h * 0.60):, :],
+            img[int(h * 0.70):, :],
+            img[int(h * 0.35):, int(w * 0.1):int(w * 0.9)],
+        ]
+    )
+    for region in candidates:
+        if region.size:
+            regions.append(region)
+    return regions
+
+
+def _variant_groups(
+    region: np.ndarray, aggressive: bool, low_quality: bool
+) -> list[np.ndarray]:
+    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
+    sharp = cv2.addWeighted(clahe, 1.6, cv2.GaussianBlur(clahe, (0, 0), 2), -0.6, 0)
+
+    if not aggressive:
+        variants: list[np.ndarray] = [region, _with_border(region), clahe, _with_border(clahe)]
+        if low_quality:
+            variants.extend(
+                [
+                    _with_border(_resize_variant(gray, 2, cv2.INTER_CUBIC)),
+                    _with_border(_resize_variant(clahe, 2, cv2.INTER_CUBIC)),
+                ]
+            )
+        return variants
+
+    thresh_gauss = cv2.adaptiveThreshold(
+        clahe,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        4,
+    )
+    variants = [
+        sharp,
+        _with_border(sharp),
+        _with_border(thresh_gauss),
+    ]
+    if low_quality and max(region.shape[:2]) < 1200:
+        variants.extend(
+            [
+                _with_border(_resize_variant(clahe, 3, cv2.INTER_CUBIC)),
+                _with_border(_resize_variant(thresh_gauss, 3, cv2.INTER_NEAREST)),
+            ]
+        )
+    return variants
+
+
+def _best_payload(found: list[str]) -> Optional[str]:
+    for value in found:
+        if "soliq.uz" in value.lower():
+            return value
+    for value in found:
+        if value.lower().startswith(("http://", "https://")):
+            return value
+    return found[0] if found else None
 
 
 def extract_qr_url(image_bytes: bytes) -> Optional[str]:
@@ -151,27 +298,19 @@ def extract_qr_url(image_bytes: bytes) -> Optional[str]:
     Decode QR codes from the image. Returns the first soliq.uz URL found,
     or the first QR payload if none match.
     """
-    img = _to_cv(image_bytes)
-    h, w = img.shape[:2]
+    img = _downscale_for_decode(_to_cv(image_bytes))
+    found: list[str] = []
+    aggressive = len(image_bytes) < 250_000 or min(img.shape[:2]) < 1000
+    low_quality = aggressive
 
-    regions = [
-        img,
-        img[h // 2:, :],                        # bottom half
-        cv2.resize(img, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC),
-    ]
+    for stage in (False, aggressive):
+        for region in _candidate_regions(img, aggressive=stage):
+            for variant in _variant_groups(
+                region, aggressive=stage, low_quality=low_quality
+            ):
+                _append_unique(found, _decode_image(variant))
+                best = _best_payload(found)
+                if best and "soliq.uz" in best.lower():
+                    return best
 
-    found = []
-    for region in regions:
-        for text in _decode_image(region):
-            if text not in found:
-                found.append(text)
-        for url in found:
-            if "soliq.uz" in url.lower():
-                return url
-
-    if not found:
-        return None
-    for url in found:
-        if "soliq.uz" in url.lower():
-            return url
-    return found[0]
+    return _best_payload(found)

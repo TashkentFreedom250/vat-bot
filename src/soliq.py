@@ -166,8 +166,12 @@ def _parse_html(html: str, qr_url: str, fallback_date: str = "") -> Optional[dic
     text = soup.get_text("\n", strip=True)
 
     vendor = _extract_vendor(soup, text)
-    vat = _extract_vat(text)
-    total = _extract_total(text)
+    vat = _extract_vat_from_table(soup)
+    if vat is None:
+        vat = _extract_vat(text)
+    total = _extract_total_from_table(soup)
+    if total is None:
+        total = _extract_total(text)
     date_str = _extract_date(text) or fallback_date
     receipt_no = _extract_receipt_number(text, qr_url)
 
@@ -187,23 +191,119 @@ def _parse_html(html: str, qr_url: str, fallback_date: str = "") -> Optional[dic
 
 # --- Extraction helpers --------------------------------------------------
 
+_TERMINAL_ID_RE = re.compile(r"^[A-Z]{1,4}\d{8,}$")
+_ADDRESS_SPLIT_RE = re.compile(
+    r"\b("
+    r"Toshkent|Andijon|Buxoro|Farg(?:'|o)?ona|Jizzax|Namangan|Navoiy|"
+    r"Qashqadaryo|Qoraqalpog'?iston|Samarqand|Sirdaryo|Surxondaryo|Xorazm|Urganch|Nukus|"
+    r"shahri|sh\.|tumani|tum\.|MFY|mavze|ko['’`]chasi|uy\b|kv\b"
+    r")\b",
+    flags=re.IGNORECASE,
+)
+_VENDOR_LABEL_BLOCKLIST = (
+    "savdo cheki",
+    "sotuv",
+    "chek raqami",
+    "onlayn nkm nomi",
+    "qqs",
+    "naqd pul",
+    "bank kartalari",
+    "jami to",
+    "umumiy qqs",
+    "sn :",
+)
+
+
+def _normalize_text(text: str) -> str:
+    return " ".join(str(text).replace("\xa0", " ").split())
+
+
+def _clean_vendor_candidate(text: str) -> str:
+    text = _normalize_text(text)
+    text = re.sub(r"\b\d{9,}\b.*$", "", text).strip()
+    m = _ADDRESS_SPLIT_RE.search(text)
+    if m:
+        text = text[:m.start()].strip(" ,.-")
+    return text.strip(" ,.-")
+
+
+def _is_vendor_candidate(text: str) -> bool:
+    text = _normalize_text(text)
+    if not text or len(text) < 3 or len(text) > 200:
+        return False
+    lowered = text.lower()
+    if any(label in lowered for label in _VENDOR_LABEL_BLOCKLIST):
+        return False
+    if text.isdigit() or _TERMINAL_ID_RE.match(text):
+        return False
+    if re.fullmatch(r"[\d\s:.,/%-]+", text):
+        return False
+    return True
+
+
+def _extract_vendor_from_table(soup: BeautifulSoup) -> str:
+    for tr in soup.select("tr"):
+        cells = [_normalize_text(td.get_text(" ", strip=True)) for td in tr.select("td,th")]
+        cells = [cell for cell in cells if cell]
+        if not cells:
+            continue
+        for cell in cells:
+            if _is_vendor_candidate(cell):
+                cleaned = _clean_vendor_candidate(cell)
+                if _is_vendor_candidate(cleaned):
+                    return cleaned
+    return ""
+
+
 def _extract_vendor(soup: BeautifulSoup, text: str) -> str:
+    table_vendor = _extract_vendor_from_table(soup)
+    if table_vendor:
+        return table_vendor
+
     # Try common class names used on soliq pages
-    for selector in [".company-name", ".seller-name", "h1", "h2", ".title"]:
+    for selector in [".company-name", ".seller-name", ".title", "h1", "h2"]:
         el = soup.select_one(selector)
         if el and el.get_text(strip=True):
-            name = el.get_text(strip=True)
-            if len(name) < 120:
+            name = _clean_vendor_candidate(el.get_text(strip=True))
+            if _is_vendor_candidate(name) and len(name) < 120:
                 return name
     # Heuristic: first non-empty line that isn't a URL or just a number
     for line in text.splitlines():
-        line = line.strip()
-        if 3 <= len(line) <= 120 and not line.startswith("http") and not line.isdigit():
+        line = _clean_vendor_candidate(line.strip())
+        if _is_vendor_candidate(line) and not line.startswith("http") and len(line) <= 120:
             return line
     return ""
 
 
 _MONEY_RE = r"([\d\s\u00a0]+(?:[.,]\d+)?)"
+
+
+def _extract_labeled_amount_from_table(soup: BeautifulSoup, labels: tuple[str, ...]) -> Optional[float]:
+    for tr in soup.select("tr"):
+        cells = [_normalize_text(td.get_text(" ", strip=True)) for td in tr.select("td,th")]
+        cells = [cell for cell in cells if cell]
+        if not cells:
+            continue
+        for idx, cell in enumerate(cells):
+            lowered = cell.lower().strip()
+            if len(lowered) > 80:
+                continue
+            if not any(label in lowered for label in labels):
+                continue
+            # Soliq tables sometimes flatten multiple labeled values into one row.
+            # In those cases, the value we want is the first numeric cell after
+            # the matching label, not the last numeric cell in the row.
+            for value_cell in cells[idx + 1:]:
+                if re.search(r"\d", value_cell):
+                    return _to_float(value_cell)
+    return None
+
+
+def _extract_vat_from_table(soup: BeautifulSoup) -> Optional[float]:
+    return _extract_labeled_amount_from_table(
+        soup,
+        ("umumiy qqs qiymati", "qqs qiymati", "ндс", "vat"),
+    )
 
 
 def _extract_vat(text: str) -> Optional[float]:
@@ -232,6 +332,13 @@ def _extract_total(text: str) -> Optional[float]:
         if m:
             return _to_float(m.group(1))
     return None
+
+
+def _extract_total_from_table(soup: BeautifulSoup) -> Optional[float]:
+    return _extract_labeled_amount_from_table(
+        soup,
+        ("jami to`lov", "jami to'lov", "to'lov uchun jami", "итого", "total"),
+    )
 
 
 def _extract_date(text: str) -> str:
@@ -291,9 +398,33 @@ def _to_float(x) -> float:
         return 0.0
     if isinstance(x, (int, float)):
         return float(x)
-    s = str(x).replace("\u00a0", " ").replace(" ", "").replace(",", ".")
-    # Strip anything non-numeric except '.' and '-'
-    s = re.sub(r"[^\d.\-]", "", s)
+    s = str(x).replace("\u00a0", " ").replace(" ", "")
+    # Strip anything non-numeric except common separators and '-'
+    s = re.sub(r"[^\d,.\-]", "", s)
+    if not s:
+        return 0.0
+
+    if "," in s and "." in s:
+        last_comma = s.rfind(",")
+        last_dot = s.rfind(".")
+        decimal_sep = "," if last_comma > last_dot else "."
+        thousands_sep = "." if decimal_sep == "," else ","
+        s = s.replace(thousands_sep, "")
+        if decimal_sep == ",":
+            s = s.replace(",", ".")
+    elif "," in s:
+        parts = s.split(",")
+        if len(parts) == 2 and len(parts[1]) in (1, 2):
+            s = ".".join(parts)
+        else:
+            s = "".join(parts)
+    elif "." in s:
+        parts = s.split(".")
+        if len(parts) == 2 and len(parts[1]) in (1, 2):
+            s = ".".join(parts)
+        else:
+            s = "".join(parts)
+
     try:
         return float(s)
     except ValueError:
