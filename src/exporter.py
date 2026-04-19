@@ -101,16 +101,34 @@ async def build_xlsx(telegram_id: int, employee_name: str, output_path: Path) ->
     return output_path
 
 
-def _draw_pil(c, pil_img: "Image.Image", x: float, y: float, max_w: float, max_h: float) -> None:
-    """Draw a PIL image fitted into (max_w × max_h) box with origin at (x, y)."""
+def _draw_pil(c, pil_img: "Image.Image", box_x: float, box_y: float,
+              box_w: float, box_h: float) -> None:
+    """Draw a PIL image scaled to fit and centered inside the given box."""
     from reportlab.lib.utils import ImageReader
     iw, ih = pil_img.size
-    ratio = min(max_w / iw, max_h / ih)
+    if iw == 0 or ih == 0:
+        return
+    ratio = min(box_w / iw, box_h / ih)
     dw, dh = iw * ratio, ih * ratio
+    dx = box_x + (box_w - dw) / 2
+    dy = box_y + (box_h - dh) / 2
     buf = BytesIO()
     pil_img.save(buf, format="PNG")
     buf.seek(0)
-    c.drawImage(ImageReader(buf), x, y, width=dw, height=dh, mask="auto")
+    c.drawImage(ImageReader(buf), dx, dy, width=dw, height=dh, mask="auto")
+
+
+def _strip_coverage(n_cols: int, iw: int, ih: int,
+                    box_w: float, box_h: float, gap: float) -> float:
+    """Total drawn area if the image is sliced into n equal-height strips side by side."""
+    if n_cols < 1:
+        return 0.0
+    col_w = (box_w - (n_cols - 1) * gap) / n_cols
+    if col_w <= 0:
+        return 0.0
+    strip_h = ih / n_cols
+    ratio = min(col_w / iw, box_h / strip_h)
+    return n_cols * (iw * ratio) * (strip_h * ratio)
 
 
 def _draw_receipt_images(
@@ -123,34 +141,40 @@ def _draw_receipt_images(
     max_h: float,
 ) -> None:
     """
-    Render receipt image(s) into the bounding box.
+    Render receipt image(s) so they fill as much of the box as possible.
 
-    • If a QR close-up is provided (two-photo flow): receipt on left ⅔, QR on right ⅓.
-    • If the receipt alone is very tall (aspect ratio > 2.2): split top/bottom halves
-      side by side so they fill the page width instead of shrinking to a thin strip.
-    • Otherwise: single image fitted to the full box.
+    • QR close-up present: receipt 2/3 width, QR 1/3 width, each centered.
+    • No QR close-up: try 1, 2, and 3 vertical-strip layouts; pick whichever
+      covers the largest area of the page box.
     """
-    gap = 4 * mm
+    gap = 3 * mm
     pil_main = Image.open(BytesIO(img_bytes)).convert("RGB")
     iw, ih = pil_main.size
 
     if qr_bytes:
-        # Two-photo flow: receipt (⅔ width) + QR close-up (⅓ width)
         receipt_w = (max_w - gap) * 2 / 3
         qr_w = max_w - gap - receipt_w
         _draw_pil(c, pil_main, x, y, receipt_w, max_h)
         pil_qr = Image.open(BytesIO(qr_bytes)).convert("RGB")
         _draw_pil(c, pil_qr, x + receipt_w + gap, y, qr_w, max_h)
-    elif ih / iw > (max_h / max_w) * 1.0:
-        # Receipt taller than the page box: split top/bottom halves side by side
-        half = ih // 2
-        top_half = pil_main.crop((0, 0, iw, half))
-        bot_half = pil_main.crop((0, half, iw, ih))
-        col_w = (max_w - gap) / 2
-        _draw_pil(c, top_half, x, y, col_w, max_h)
-        _draw_pil(c, bot_half, x + col_w + gap, y, col_w, max_h)
-    else:
+        return
+
+    best_n = max(
+        (1, 2, 3),
+        key=lambda n: _strip_coverage(n, iw, ih, max_w, max_h, gap),
+    )
+
+    if best_n == 1:
         _draw_pil(c, pil_main, x, y, max_w, max_h)
+        return
+
+    col_w = (max_w - (best_n - 1) * gap) / best_n
+    strip_h = ih // best_n
+    for i in range(best_n):
+        top = i * strip_h
+        bot = ih if i == best_n - 1 else (i + 1) * strip_h
+        strip = pil_main.crop((0, top, iw, bot))
+        _draw_pil(c, strip, x + i * (col_w + gap), y, col_w, max_h)
 
 
 async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> Path:
@@ -179,7 +203,11 @@ async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> 
     c.drawString(margin + 10 * mm, y, "Date")
     c.drawString(margin + 35 * mm, y, "Vendor")
     c.drawString(margin + 100 * mm, y, "Receipt #")
-    c.drawString(margin + 150 * mm, y, "VAT (UZS)")
+    c.drawRightString(margin + 185 * mm, y, "VAT (UZS)")
+    y -= 2 * mm
+    c.setStrokeColorRGB(0.6, 0.6, 0.6)
+    c.setLineWidth(0.3)
+    c.line(margin, y, width - margin, y)
     y -= 5 * mm
     c.setFont("Helvetica", 9)
     for i, r in enumerate(receipts, 1):
@@ -195,10 +223,15 @@ async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> 
         vat = float(r.get("vat_amount") or 0)
         c.drawRightString(margin + 185 * mm, y, f"{vat:,.2f}")
         y -= 5 * mm
+    y += 2 * mm
+    c.line(margin, y, width - margin, y)
+    y -= 6 * mm
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(margin + 100 * mm, y, "TOTAL")
+    c.drawRightString(margin + 185 * mm, y, f"{total_vat:,.2f}")
 
     # --- One page per receipt image ---
-    from reportlab.lib.utils import ImageReader
-
+    n_receipts = len(receipts)
     for i, r in enumerate(receipts, 1):
         file_id = r.get("image_file_id")
         if not file_id:
@@ -221,17 +254,26 @@ async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> 
         c.setFont("Helvetica", 10)
         c.drawString(
             margin, height - margin - 6 * mm,
-            f"{r.get('date','')}  |  {_display_vendor(r)}  |  VAT: {float(r.get('vat_amount') or 0):,.2f} UZS",
+            f"{r.get('date','') or '—'}  •  {_display_vendor(r) or '—'}  •  "
+            f"VAT: {float(r.get('vat_amount') or 0):,.2f} UZS",
         )
 
-        max_w = width - 2 * margin
-        max_h = height - 2 * margin - 15 * mm
+        # Image box: from bottom margin up to just below the header
+        img_box_y = margin + 6 * mm  # leave room for page-number footer
+        img_box_h = height - margin - 12 * mm - img_box_y
+        img_box_w = width - 2 * margin
 
         try:
-            _draw_receipt_images(c, img_bytes, qr_bytes, margin, margin, max_w, max_h)
+            _draw_receipt_images(c, img_bytes, qr_bytes, margin, img_box_y, img_box_w, img_box_h)
         except Exception:
             c.setFont("Helvetica-Oblique", 10)
             c.drawString(margin, height / 2, "[Image could not be rendered]")
+
+        # Footer: page number
+        c.setFont("Helvetica", 8)
+        c.setFillGray(0.5)
+        c.drawRightString(width - margin, margin / 2, f"Receipt {i} of {n_receipts}")
+        c.setFillGray(0)
 
     c.save()
     return output_path
