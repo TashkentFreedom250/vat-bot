@@ -31,6 +31,11 @@ def get_db():
         _client = AsyncIOMotorClient(
             config.MONGODB_URI,
             serverSelectionTimeoutMS=config.MONGODB_SERVER_SELECTION_TIMEOUT_MS,
+            maxPoolSize=32,
+            minPoolSize=4,
+            connectTimeoutMS=2000,
+            socketTimeoutMS=15000,
+            compressors="zstd,snappy,zlib",
         )
         _db = _client[config.MONGODB_DB]
         _fs = AsyncIOMotorGridFSBucket(_db)

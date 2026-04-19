@@ -18,6 +18,7 @@ import logging
 import os
 import shutil
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -43,6 +44,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("vat_bot")
 SAVE_DEBUG_IMAGES = os.getenv("SAVE_DEBUG_IMAGES", "").lower() in {"1", "true", "yes"}
+
+# Image processing (OpenCV, zxing, PIL) releases the GIL — use all cores
+_executor = ThreadPoolExecutor(
+    max_workers=(os.cpu_count() or 4) * 2,
+    thread_name_prefix="vat-worker",
+)
 
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -122,16 +129,18 @@ def _format_ocr_preview(preview: dict, intro: str = "I couldn't verify the QR co
 
 
 async def _decode_qr(loop: asyncio.AbstractEventLoop, image_bytes: bytes, cropped_bytes: bytes) -> str | None:
-    qr_url = None
     try:
-        qr_url = await loop.run_in_executor(None, receipt_image.extract_qr_url, image_bytes)
-        logger.info("QR from original: %s", qr_url)
-        if not qr_url:
-            qr_url = await loop.run_in_executor(None, receipt_image.extract_qr_url, cropped_bytes)
-            logger.info("QR from cropped: %s", qr_url)
+        # Try both images concurrently — crop and original are independent inputs
+        original_task = loop.run_in_executor(None, receipt_image.extract_qr_url, image_bytes)
+        cropped_task = loop.run_in_executor(None, receipt_image.extract_qr_url, cropped_bytes)
+        results = await asyncio.gather(original_task, cropped_task, return_exceptions=True)
+        for r in results:
+            if isinstance(r, str) and r:
+                logger.info("QR found: %s", r)
+                return r
     except Exception:
         logger.exception("QR decode failed")
-    return qr_url
+    return None
 
 
 async def _save_verified_receipt(
@@ -379,18 +388,23 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Saved raw image: %s (%s bytes)", raw_path, len(image_bytes))
 
     loop = asyncio.get_running_loop()
-    pending = await db.get_pending_receipt(uid)
 
-    try:
-        cropped_bytes = await loop.run_in_executor(
-            None, receipt_image.auto_crop_receipt, image_bytes
-        )
+    # Run DB lookup and image crop in parallel — they're fully independent
+    pending, crop_result = await asyncio.gather(
+        db.get_pending_receipt(uid),
+        loop.run_in_executor(None, receipt_image.auto_crop_receipt, image_bytes),
+        return_exceptions=True,
+    )
+    if isinstance(pending, Exception):
+        pending = None
+    if isinstance(crop_result, Exception):
+        logger.exception("Crop failed: %s", crop_result)
+        cropped_bytes = image_bytes
+    else:
+        cropped_bytes = crop_result
         if debug_dir is not None:
             (debug_dir / f"crop_{uid}_{debug_id}.png").write_bytes(cropped_bytes)
         logger.info("Cropped image: %s bytes", len(cropped_bytes))
-    except Exception:
-        logger.exception("Crop failed")
-        cropped_bytes = image_bytes
 
     qr_url = await _decode_qr(loop, image_bytes, cropped_bytes)
 
@@ -518,7 +532,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     message, saved = await _save_verified_receipt(
         uid=uid,
         source_image_bytes=pending_image_bytes,
@@ -534,6 +548,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 # ---------- App setup ----------
 
 async def _post_init(app: Application) -> None:
+    asyncio.get_running_loop().set_default_executor(_executor)
     _clear_local_cache_dirs()
     me = await app.bot.get_me()
     logger.info("Connected to Telegram as @%s", me.username)
@@ -571,6 +586,7 @@ def main() -> None:
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
         .post_init(_post_init)
+        .concurrent_updates(True)
         .build()
     )
 
