@@ -283,20 +283,20 @@ def _variant_groups(
     return variants
 
 
-def _best_payload(found: list[str]) -> Optional[str]:
+def _soliq_payload(found: list[str]) -> Optional[str]:
     for value in found:
         if "soliq.uz" in value.lower():
             return value
-    for value in found:
-        if value.lower().startswith(("http://", "https://")):
-            return value
-    return found[0] if found else None
+    return None
 
 
 def extract_qr_url(image_bytes: bytes) -> Optional[str]:
     """
-    Decode QR codes from the image. Returns the first soliq.uz URL found,
-    or the first QR payload if none match.
+    Decode QR codes from the image and return the soliq.uz URL.
+
+    Receipts may contain multiple QR codes (payment, delivery, ads).
+    We only ever return the soliq.uz one — if none is found, return None
+    so the caller can tell the user no fiscal QR was detected.
     """
     img = _downscale_for_decode(_to_cv(image_bytes))
     found: list[str] = []
@@ -309,8 +309,8 @@ def extract_qr_url(image_bytes: bytes) -> Optional[str]:
                 region, aggressive=stage, low_quality=low_quality
             ):
                 _append_unique(found, _decode_image(variant))
-                best = _best_payload(found)
-                if best and "soliq.uz" in best.lower():
-                    return best
+                soliq = _soliq_payload(found)
+                if soliq:
+                    return soliq
 
-    return _best_payload(found)
+    return None
