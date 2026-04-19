@@ -24,7 +24,10 @@ _fs: Optional[AsyncIOMotorGridFSBucket] = None
 def get_db():
     global _client, _db, _fs
     if _client is None:
-        _client = AsyncIOMotorClient(config.MONGODB_URI)
+        _client = AsyncIOMotorClient(
+            config.MONGODB_URI,
+            serverSelectionTimeoutMS=config.MONGODB_SERVER_SELECTION_TIMEOUT_MS,
+        )
         _db = _client[config.MONGODB_DB]
         _fs = AsyncIOMotorGridFSBucket(_db)
     return _db
@@ -42,6 +45,11 @@ async def ensure_indexes() -> None:
     await db.receipts.create_index(
         [("telegram_id", 1), ("receipt_number", 1)], unique=True, sparse=True
     )
+
+
+async def ping() -> None:
+    db = get_db()
+    await db.command("ping")
 
 
 async def upsert_user(telegram_id: int, name: str) -> None:
