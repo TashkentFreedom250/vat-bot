@@ -18,16 +18,19 @@ from PIL import Image
 from . import config, db
 
 # XLSX layout (inspected from the template):
-# Row 7 is header; rows 8..37 hold receipts 1..30 on "Table" sheet.
-# Each "Continuation*" sheet starts at row 7 header as well, data rows 8..37.
 # Columns: A=#, B=Date, C=Vendor, D=Receipt#, E=VAT Amount
+# D5:E5 merged  = employee name field (Table sheet) / =Table!D5 formula (continuation sheets)
+# D6:E6 merged  = grand total (Table sheet only)
+# E40            = per-sheet SUM (each sheet)
 SHEETS_ORDER = ["Table", "Continuation", "Continuation2", "Continuation3"]
 ROWS_PER_SHEET = 30
-DATA_START_ROW = 8  # Based on extract-text output structure
-NAME_CELL = "B4"    # "Employee Name" row, column B
-GRAND_TOTAL_CELL = "D5"  # Top grand total cell
-PER_SHEET_TOTAL_ROW = 38  # Row with "Total:" at end of each table
-PER_SHEET_TOTAL_COL = "E"
+DATA_START_ROW = 9   # First data row (A9 = 1)
+NAME_ROW = 5         # Row of the employee name merged cell D5:E5
+NAME_COL = 4         # Column D
+GRAND_TOTAL_ROW = 6  # Row of grand total merged cell D6:E6
+GRAND_TOTAL_COL = 4  # Column D
+PER_SHEET_TOTAL_ROW = 40  # Row with per-sheet SUM
+PER_SHEET_TOTAL_COL = 5   # Column E
 
 
 def _display_vendor(doc: dict) -> str:
@@ -61,34 +64,38 @@ async def build_xlsx(telegram_id: int, employee_name: str, output_path: Path) ->
     wb = load_workbook(output_path)
 
     receipts = await db.list_receipts(telegram_id)
+    grand_total = 0.0
 
-    # Write name on every sheet that has an Employee Name field
-    for sheet_name in SHEETS_ORDER:
-        if sheet_name not in wb.sheetnames:
-            continue
-        ws = wb[sheet_name]
-        name_cell = _find_name_cell(ws)
-        if name_cell:
-            ws.cell(row=name_cell[0], column=name_cell[1], value=employee_name)
-
-    # Chunk receipts across sheets (30 per sheet)
+    # Chunk receipts across sheets (30 per sheet), write data + per-sheet totals
     for idx, sheet_name in enumerate(SHEETS_ORDER):
         if sheet_name not in wb.sheetnames:
             continue
         ws = wb[sheet_name]
-        start = idx * ROWS_PER_SHEET
-        chunk = receipts[start : start + ROWS_PER_SHEET]
+        chunk = receipts[idx * ROWS_PER_SHEET : (idx + 1) * ROWS_PER_SHEET]
         if not chunk and idx > 0:
             continue
 
-        data_start = _find_data_start(ws)
+        # Write employee name directly (D5 is the top-left of the D5:E5 merged cell)
+        ws.cell(row=NAME_ROW, column=NAME_COL, value=employee_name)
+
+        # Write receipt rows
+        sheet_total = 0.0
         for i, r in enumerate(chunk):
-            row = data_start + i
-            # Column A (#) is already filled in the template; leave it.
+            row = DATA_START_ROW + i
             ws.cell(row=row, column=2, value=r.get("date", ""))
             ws.cell(row=row, column=3, value=_display_vendor(r))
             ws.cell(row=row, column=4, value=r.get("receipt_number", ""))
-            ws.cell(row=row, column=5, value=r.get("vat_amount", 0) or 0)
+            vat = float(r.get("vat_amount") or 0)
+            ws.cell(row=row, column=5, value=vat)
+            sheet_total += vat
+
+        # Write per-sheet total as a value (E40), replacing the formula
+        ws.cell(row=PER_SHEET_TOTAL_ROW, column=PER_SHEET_TOTAL_COL, value=sheet_total)
+        grand_total += sheet_total
+
+    # Write grand total as a value to D6 in Table sheet (D6:E6 merged cell)
+    if "Table" in wb.sheetnames:
+        wb["Table"].cell(row=GRAND_TOTAL_ROW, column=GRAND_TOTAL_COL, value=grand_total)
 
     wb.save(output_path)
     return output_path
