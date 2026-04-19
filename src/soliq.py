@@ -19,6 +19,7 @@ Returns a normalized dict:
 """
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime
 from typing import Optional
@@ -28,6 +29,8 @@ import httpx
 from bs4 import BeautifulSoup
 
 from . import config
+
+logger = logging.getLogger("vat_bot.soliq")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -40,58 +43,67 @@ async def fetch_receipt_data(qr_url: str) -> Optional[dict]:
     if not qr_url:
         return None
 
+    try:
+        qs = parse_qs(urlparse(qr_url).query)
+    except Exception:
+        qs = {}
+
+    terminal = (qs.get("t") or [None])[0]
+    receipt = (qs.get("r") or [None])[0]
+    date_param = (qs.get("c") or [None])[0]
+    amount_param = (qs.get("s") or [None])[0]
+    fallback_date = _date_from_qr_param(qr_url)
+
+    # Build a deduplicated list of URLs to try.
+    # We only add the /api/check variant if it differs from qr_url.
+    urls_to_try: list[str] = [qr_url]
+    if terminal and receipt:
+        alt = (
+            f"https://ofd.soliq.uz/api/check"
+            f"?t={terminal}&r={receipt}&c={date_param}&s={amount_param}"
+        )
+        if alt != qr_url:
+            urls_to_try.append(alt)
+
     async with httpx.AsyncClient(
         timeout=config.SOLIQ_TIMEOUT,
         headers={"User-Agent": USER_AGENT, "Accept-Language": "uz,en;q=0.9,ru;q=0.8"},
         follow_redirects=True,
     ) as client:
-        # 1) Try the JSON API first (ofd.soliq.uz exposes one for some terminals)
-        data = await _try_json_api(client, qr_url)
-        if data:
-            return data
+        for url in urls_to_try:
+            try:
+                resp = await client.get(url)
+            except Exception as exc:
+                logger.warning("soliq.uz fetch error for %s: %s", url, exc)
+                continue
 
-        # 2) Fall back to HTML scraping of the consumer receipt page
-        try:
-            resp = await client.get(qr_url)
-            resp.raise_for_status()
-        except httpx.HTTPError:
-            return None
+            if resp.status_code != 200:
+                logger.warning("soliq.uz returned HTTP %s for %s", resp.status_code, url)
+                continue
 
-        fallback_date = _date_from_qr_param(qr_url)
-        return _parse_html(resp.text, qr_url, fallback_date=fallback_date)
+            content_type = resp.headers.get("content-type", "")
+            logger.info("soliq.uz %s → %s, content-type=%s, len=%s",
+                        url, resp.status_code, content_type, len(resp.text))
 
+            # Try JSON first (some terminals return application/json)
+            if "application/json" in content_type:
+                try:
+                    data = resp.json()
+                    normalized = _normalize_json(data, terminal or "", receipt or "")
+                    if normalized:
+                        return normalized
+                except Exception as exc:
+                    logger.warning("JSON parse failed: %s", exc)
 
-async def _try_json_api(client: httpx.AsyncClient, qr_url: str) -> Optional[dict]:
-    """Try known soliq.uz JSON endpoints based on the QR URL parameters."""
-    try:
-        parsed = urlparse(qr_url)
-        qs = parse_qs(parsed.query)
-    except Exception:
-        return None
+            # Fall back to HTML scraping
+            try:
+                result = _parse_html(resp.text, qr_url, fallback_date=fallback_date)
+                if result:
+                    return result
+            except Exception as exc:
+                logger.warning("HTML parse error for %s: %s", url, exc)
 
-    terminal = (qs.get("t") or [None])[0]
-    receipt = (qs.get("r") or [None])[0]
-    date = (qs.get("c") or [None])[0]
-    amount = (qs.get("s") or [None])[0]
-
-    if not (terminal and receipt):
-        return None
-
-    # Known endpoint format
-    endpoints = [
-        f"https://ofd.soliq.uz/check?t={terminal}&r={receipt}&c={date}&s={amount}",
-        f"https://ofd.soliq.uz/api/check?t={terminal}&r={receipt}&c={date}&s={amount}",
-    ]
-    for url in endpoints:
-        try:
-            resp = await client.get(url, headers={"Accept": "application/json"})
-            if resp.status_code == 200 and "application/json" in resp.headers.get("content-type", ""):
-                data = resp.json()
-                normalized = _normalize_json(data, terminal, receipt)
-                if normalized:
-                    return normalized
-        except Exception:
-            continue
+    logger.warning("fetch_receipt_data: all attempts failed for %s", qr_url)
     return None
 
 
@@ -300,10 +312,11 @@ def _extract_labeled_amount_from_table(soup: BeautifulSoup, labels: tuple[str, .
 
 
 def _extract_vat_from_table(soup: BeautifulSoup) -> Optional[float]:
-    return _extract_labeled_amount_from_table(
-        soup,
-        ("umumiy qqs qiymati", "qqs qiymati", "ндс", "vat"),
-    )
+    # Prefer the "Umumiy QQS qiymati" (total VAT) row over per-item rows.
+    total = _extract_labeled_amount_from_table(soup, ("umumiy qqs qiymati",))
+    if total is not None:
+        return total
+    return _extract_labeled_amount_from_table(soup, ("qqs qiymati", "ндс", "vat"))
 
 
 def _extract_vat(text: str) -> Optional[float]:
