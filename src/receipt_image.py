@@ -94,14 +94,20 @@ def auto_crop_receipt(image_bytes: bytes) -> bytes:
     receipt_contour = None
     for c in contours:
         peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        # Slightly looser epsilon catches receipts with curved/tapered edges
+        approx = cv2.approxPolyDP(c, 0.03 * peri, True)
         if len(approx) == 4 and cv2.contourArea(c) > (small.shape[0] * small.shape[1]) * 0.1:
             receipt_contour = approx
             break
 
     if receipt_contour is not None:
         pts = receipt_contour.reshape(4, 2).astype("float32") / scale if scale < 1 else receipt_contour.reshape(4, 2).astype("float32")
+        # Expand corners outward so the warp doesn't clip receipt edges
+        pts = _expand_corners(pts, margin=0.025)
+        pts[:, 0] = np.clip(pts[:, 0], 0, orig.shape[1] - 1)
+        pts[:, 1] = np.clip(pts[:, 1], 0, orig.shape[0] - 1)
         warped = _four_point_transform(orig, pts)
+        warped = _fix_orientation(warped)
         return _to_png_bytes(warped)
 
     # Fallback: bounding box of largest contour
@@ -111,13 +117,35 @@ def auto_crop_receipt(image_bytes: bytes) -> bytes:
     x, y, cw, ch = cv2.boundingRect(c)
     if scale < 1:
         x, y, cw, ch = int(x / scale), int(y / scale), int(cw / scale), int(ch / scale)
-    # Add small padding
-    pad = 10
+    pad = 40
     x = max(0, x - pad); y = max(0, y - pad)
     cw = min(orig.shape[1] - x, cw + 2 * pad)
     ch = min(orig.shape[0] - y, ch + 2 * pad)
     cropped = orig[y:y + ch, x:x + cw]
+    cropped = _fix_orientation(cropped)
     return _to_png_bytes(cropped)
+
+
+def _expand_corners(pts: np.ndarray, margin: float = 0.025) -> np.ndarray:
+    """Push 4 corner points outward from centroid by margin fraction."""
+    centroid = pts.mean(axis=0)
+    return pts + (pts - centroid) * margin
+
+
+def _fix_orientation(img: np.ndarray) -> np.ndarray:
+    """Rotate 180° when the soliq.uz QR is in the top half (upside-down photo)."""
+    h = img.shape[0]
+    top = img[:h // 2, :]
+    try:
+        data, _, _ = _QR_DETECTOR.detectAndDecode(top)
+        if data and "soliq.uz" in data.lower():
+            bot = img[h // 2:, :]
+            b_data, _, _ = _QR_DETECTOR.detectAndDecode(bot)
+            if not (b_data and "soliq.uz" in b_data.lower()):
+                return cv2.rotate(img, cv2.ROTATE_180)
+    except Exception:
+        pass
+    return img
 
 
 def _to_png_bytes(cv_img: np.ndarray) -> bytes:
