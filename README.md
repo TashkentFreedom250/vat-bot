@@ -1,4 +1,4 @@
-# VAT Refund Telegram Bot 🧾
+# VAT Refund Telegram Bot
 
 A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts and file VAT refund requests automatically.
 
@@ -24,20 +24,49 @@ A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts an
 | `/reset` | Delete all receipts |
 | `/help` | Show help |
 
-## Tech stack
+## Running on Mac (recommended)
 
-- **python-telegram-bot 21** — bot framework (async)
-- **MongoDB + Motor + GridFS** — receipt metadata + image storage
-- **OpenCV + Pillow** — auto-crop receipts via contour detection + perspective warp
-- **pyzbar** — QR code decoding
-- **httpx + BeautifulSoup** — async scraping of soliq.uz / ofd.soliq.uz
-- **openpyxl** — fill the official XLSX template
-- **reportlab** — generate PDF package
+The bot runs best on a Mac physically located in Uzbekistan. `ofd.soliq.uz` geo-blocks all cloud provider IPs — it only responds to Uzbekistan ISP addresses.
+
+### First-time setup
+
+```bash
+git clone https://github.com/TashkentFreedom250/vat-bot.git
+cd vat-bot
+
+# Copy and fill in your bot token
+cp .env.example .env
+# Edit .env — set TELEGRAM_BOT_TOKEN (from @BotFather on Telegram)
+# Leave MONGODB_URI as mongodb://localhost:27017
+
+# Run — installs everything automatically on first launch
+bash run_bot.sh
+```
+
+`run_bot.sh` handles:
+- Installing Python 3.11 (via Homebrew)
+- Installing & starting MongoDB locally (free, no Atlas account needed)
+- Installing all Python dependencies into a `.venv`
+- Starting the bot
+
+### Subsequent launches
+
+```bash
+bash run_bot.sh
+```
+
+MongoDB starts automatically on Mac login, so the bot will always have a database ready.
+
+### Getting a bot token
+
+1. Talk to **@BotFather** on Telegram
+2. `/newbot` → follow the prompts
+3. Copy the token into `TELEGRAM_BOT_TOKEN` in `.env`
 
 ## Project layout
 
 ```
-vat_bot/
+vat-bot/
 ├── src/
 │   ├── bot.py              # Telegram handlers + entry point
 │   ├── config.py           # Env loading
@@ -47,71 +76,22 @@ vat_bot/
 │   └── exporter.py         # XLSX + PDF export
 ├── templates/
 │   └── VAT_Refund.xlsx     # Official template
+├── run_bot.sh              # One-command Mac setup & launcher
 ├── requirements.txt
-├── Dockerfile              # For Railway deployment
-├── Procfile                # For Heroku (if you prefer)
-├── railway.json
+├── Dockerfile              # For containerized deployment
 ├── .env.example
 └── README.md
 ```
 
-## Quick deploy (office PC)
+## Tech stack
 
-```bash
-git clone https://github.com/TashkentFreedom250/vat-bot.git
-cd vat-bot
-pip install -r requirements.txt
-# copy your .env file across (it has TELEGRAM_BOT_TOKEN, MONGODB_URI, etc.)
-python -m src.bot
-```
-
-> **Important:** This bot must run on a machine physically located in Uzbekistan.
-> `ofd.soliq.uz` (the Uzbekistan tax authority) geo-blocks all cloud provider IPs (AWS, Railway, Render, Fly.io, etc.).
-> It only responds to Uzbekistan ISP IPs. Running it on an office PC in Tashkent works perfectly.
-
-## Local setup (first time)
-
-```bash
-# 1. Clone and enter the project
-git clone https://github.com/TashkentFreedom250/vat-bot.git
-cd vat-bot
-
-# 2. Install system deps (for pyzbar and opencv)
-# Ubuntu/Debian:
-sudo apt-get install libzbar0 libgl1
-
-# 3. Python deps
-pip install -r requirements.txt
-
-# 4. Configure environment
-cp .env.example .env
-# Edit .env and fill in TELEGRAM_BOT_TOKEN and MONGODB_URI
-
-# 5. Run
-python -m src.bot
-```
-
-### Getting a bot token
-
-1. Talk to **@BotFather** on Telegram
-2. `/newbot` → follow the prompts
-3. Copy the token into `TELEGRAM_BOT_TOKEN` in `.env`
-
-### Getting MongoDB
-
-Since you already know MongoDB, the easiest free path:
-1. Sign up at **MongoDB Atlas** (free tier: 512 MB, plenty for this)
-2. Create a cluster → Database Access → add a user
-3. Network Access → allow `0.0.0.0/0` (or Railway's IPs)
-4. Copy the connection string into `MONGODB_URI` in `.env`
-
-## Cloud deployment
-
-> **Not recommended** — `ofd.soliq.uz` geo-blocks all cloud provider IPs (AWS, Railway, Render, Fly.io, Cloudflare).
-> Requests time out or return HTTP 522. Run the bot on a PC inside Uzbekistan instead.
->
-> If you later get a Uzbekistan-based VPS (e.g. Comnet.uz, Uztelecom hosting, ~$5–10/month),
-> it will work fine there too — just clone and run as above.
+- **python-telegram-bot 21** — bot framework (async)
+- **MongoDB Community + Motor + GridFS** — local receipt storage (free, no cloud needed)
+- **OpenCV + Pillow** — auto-crop receipts via contour detection + perspective warp
+- **pyzbar / zxing-cpp** — QR code decoding
+- **httpx + BeautifulSoup** — async scraping of soliq.uz / ofd.soliq.uz
+- **openpyxl** — fill the official XLSX template
+- **reportlab** — generate PDF package
 
 ## How the soliq.uz scraper works
 
@@ -126,19 +106,12 @@ The bot:
 2. First tries the structured **JSON endpoint** at `ofd.soliq.uz/check`
 3. Falls back to **HTML scraping** of the consumer-facing receipt page
 
-This is much more reliable than OCR'ing the paper receipt — you get the **authoritative** VAT amount straight from the tax authority.
+This gives the **authoritative** VAT amount straight from the tax authority — far more reliable than OCR.
 
 ## Notes & limitations
 
 - **Template capacity**: 120 receipts (30 per sheet × 4 sheets). The bot warns if you exceed this.
-- **Duplicate detection**: the same `receipt_number` can't be added twice per user.
+- **Duplicate detection**: the same receipt number can't be added twice per user.
 - **soliq.uz availability**: if soliq.uz is down, the bot tells the user and doesn't save a broken record.
 - **Privacy**: receipts are stored per Telegram user ID. Only you can see your receipts.
-
-## Future ideas
-
-- OCR fallback when the QR can't be decoded
-- Automatic currency conversion to USD using CBU.uz rates
-- Multi-language UI (Uzbek / Russian / English)
-- `/delete <n>` to remove a single receipt
-- Export by date range
+- **Geo-blocking**: the bot must run on a machine with a Uzbekistan IP. Cloud providers (AWS, Railway, Render, Fly.io) are blocked.
