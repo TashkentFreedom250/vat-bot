@@ -65,56 +65,53 @@ async def fetch_receipt_data(qr_url: str) -> Optional[dict]:
         if alt != qr_url:
             urls_to_try.append(alt)
 
-    # Try once with SSL verification, then once without (some UZ government
-    # servers use cert chains not trusted by Debian's default CA bundle).
-    ssl_configs = [True, False]
+    def _make_fetch_url(target: str) -> str:
+        """Route through Cloudflare Worker proxy if SOLIQ_PROXY_URL is set."""
+        if config.SOLIQ_PROXY_URL:
+            from urllib.parse import quote
+            return f"{config.SOLIQ_PROXY_URL}?url={quote(target, safe='')}"
+        return target
 
-    for verify_ssl in ssl_configs:
-        async with httpx.AsyncClient(
-            timeout=config.SOLIQ_TIMEOUT,
-            headers={"User-Agent": USER_AGENT, "Accept-Language": "uz,en;q=0.9,ru;q=0.8"},
-            follow_redirects=True,
-            verify=verify_ssl,
-        ) as client:
-            for url in urls_to_try:
+    async with httpx.AsyncClient(
+        timeout=config.SOLIQ_TIMEOUT,
+        headers={"User-Agent": USER_AGENT, "Accept-Language": "uz,en;q=0.9,ru;q=0.8"},
+        follow_redirects=True,
+    ) as client:
+        for url in urls_to_try:
+            fetch_url = _make_fetch_url(url)
+            try:
+                resp = await client.get(fetch_url)
+            except Exception as exc:
+                logger.warning("soliq.uz fetch error for %s: %r", url, exc)
+                continue
+
+            if resp.status_code != 200:
+                logger.warning("soliq.uz returned HTTP %s for %s", resp.status_code, url)
+                continue
+
+            content_type = resp.headers.get("content-type", "")
+            logger.info(
+                "soliq.uz %s → %s, content-type=%s, len=%s",
+                url, resp.status_code, content_type, len(resp.text),
+            )
+
+            # Try JSON first (some terminals return application/json)
+            if "application/json" in content_type:
                 try:
-                    resp = await client.get(url)
+                    data = resp.json()
+                    normalized = _normalize_json(data, terminal or "", receipt or "")
+                    if normalized:
+                        return normalized
                 except Exception as exc:
-                    logger.warning(
-                        "soliq.uz fetch error (verify_ssl=%s) for %s: %r",
-                        verify_ssl, url, exc,
-                    )
-                    continue
+                    logger.warning("JSON parse failed: %s", exc)
 
-                if resp.status_code != 200:
-                    logger.warning(
-                        "soliq.uz returned HTTP %s for %s", resp.status_code, url
-                    )
-                    continue
-
-                content_type = resp.headers.get("content-type", "")
-                logger.info(
-                    "soliq.uz %s → %s, content-type=%s, len=%s, verify_ssl=%s",
-                    url, resp.status_code, content_type, len(resp.text), verify_ssl,
-                )
-
-                # Try JSON first (some terminals return application/json)
-                if "application/json" in content_type:
-                    try:
-                        data = resp.json()
-                        normalized = _normalize_json(data, terminal or "", receipt or "")
-                        if normalized:
-                            return normalized
-                    except Exception as exc:
-                        logger.warning("JSON parse failed: %s", exc)
-
-                # Fall back to HTML scraping
-                try:
-                    result = _parse_html(resp.text, qr_url, fallback_date=fallback_date)
-                    if result:
-                        return result
-                except Exception as exc:
-                    logger.warning("HTML parse error for %s: %s", url, exc)
+            # Fall back to HTML scraping
+            try:
+                result = _parse_html(resp.text, qr_url, fallback_date=fallback_date)
+                if result:
+                    return result
+            except Exception as exc:
+                logger.warning("HTML parse error for %s: %s", url, exc)
 
     logger.warning("fetch_receipt_data: all attempts failed for %s", qr_url)
     return None
