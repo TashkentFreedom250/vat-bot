@@ -11,6 +11,11 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python - <<'PY'
+from rapidocr import RapidOCR
+RapidOCR(params={"Global.log_level": "WARNING"})
+print("RapidOCR models ready")
+PY
 
 COPY . .
 

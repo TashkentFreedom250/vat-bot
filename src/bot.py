@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -77,6 +78,20 @@ async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception while processing an update.", exc_info=ctx.error)
 
 
+def _clear_local_cache_dirs() -> None:
+    for path in (config.TMP_DIR, Path("debug_images")):
+        if not path.exists():
+            continue
+        for child in path.iterdir():
+            try:
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+            except Exception:
+                logger.exception("Failed to remove cache path: %s", child)
+
+
 def _display_vendor(doc: dict) -> str:
     return doc.get("display_vendor") or doc.get("printed_vendor") or doc.get("vendor") or ""
 
@@ -106,6 +121,78 @@ def _format_ocr_preview(preview: dict, intro: str = "I couldn't verify the QR co
     return "\n".join(lines)
 
 
+async def _decode_qr(loop: asyncio.AbstractEventLoop, image_bytes: bytes, cropped_bytes: bytes) -> str | None:
+    qr_url = None
+    try:
+        qr_url = await loop.run_in_executor(None, receipt_image.extract_qr_url, image_bytes)
+        logger.info("QR from original: %s", qr_url)
+        if not qr_url:
+            qr_url = await loop.run_in_executor(None, receipt_image.extract_qr_url, cropped_bytes)
+            logger.info("QR from cropped: %s", qr_url)
+    except Exception:
+        logger.exception("QR decode failed")
+    return qr_url
+
+
+async def _save_verified_receipt(
+    *,
+    uid: int,
+    source_image_bytes: bytes,
+    qr_url: str,
+    loop: asyncio.AbstractEventLoop,
+) -> tuple[str, bool]:
+    data = await soliq.fetch_receipt_data(qr_url)
+    if not data:
+        return (
+            "I read the QR code but could not fetch data from soliq.uz "
+            "(the page may be down, or this QR is not a soliq.uz fiscal link).\n"
+            f"QR content: {qr_url[:200]}",
+            False,
+        )
+
+    printed_vendor = None
+    try:
+        printed_vendor = await loop.run_in_executor(
+            None, receipt_ocr.extract_printed_vendor, source_image_bytes
+        )
+    except Exception:
+        logger.exception("Printed vendor OCR failed")
+
+    display_vendor = printed_vendor or data.get("vendor", "")
+    file_id = await db.save_image(uid, source_image_bytes, f"receipt_{uid}.png")
+    receipt_doc = {
+        "telegram_id": uid,
+        "image_file_id": file_id,
+        "date": data.get("date", ""),
+        "vendor": data.get("vendor", ""),
+        "printed_vendor": printed_vendor or "",
+        "display_vendor": display_vendor,
+        "receipt_number": data.get("receipt_number", ""),
+        "vat_amount": data.get("vat_amount", 0.0),
+        "total_amount": data.get("total_amount", 0.0),
+        "soliq_url": qr_url,
+        "raw_qr": qr_url,
+    }
+    inserted = await db.save_receipt(receipt_doc)
+    if inserted is None:
+        return (
+            f"This receipt (#{data.get('receipt_number')}) is already in your records.",
+            False,
+        )
+
+    count = await db.count_receipts(uid)
+    return (
+        f"Receipt added (#{count})\n\n"
+        f"Vendor: {display_vendor or '-'}\n"
+        f"Date: {data.get('date', '-')}\n"
+        f"Receipt #: {data.get('receipt_number', '-')}\n"
+        f"Total: {data.get('total_amount', 0):,.2f} UZS\n"
+        f"VAT: {data.get('vat_amount', 0):,.2f} UZS\n"
+        "Verified tax data source: soliq.uz",
+        True,
+    )
+
+
 # ---------- Commands ----------
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -121,6 +208,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/list - show stored receipts\n"
         "/export_vat - download filled VAT_Refund.xlsx\n"
         "/export_pdf - download PDF with all receipts\n"
+        "/cancel_pending - discard a receipt waiting for a QR close-up\n"
         "/reset - delete everything\n"
         "/help - show this message"
     )
@@ -210,8 +298,17 @@ async def cmd_export_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await db.delete_pending_receipt(update.effective_user.id)
     n = await db.delete_all_receipts(update.effective_user.id)
     await update.message.reply_text(f"Deleted {n} receipt(s).")
+
+
+async def cmd_cancel_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    deleted = await db.delete_pending_receipt(update.effective_user.id)
+    if deleted:
+        await update.message.reply_text("Pending receipt discarded. You can send a new receipt now.")
+        return
+    await update.message.reply_text("There is no pending QR retry right now.")
 
 
 # ---------- Photo handler ----------
@@ -264,6 +361,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("Saved raw image: %s (%s bytes)", raw_path, len(image_bytes))
 
     loop = asyncio.get_running_loop()
+    pending = await db.get_pending_receipt(uid)
 
     try:
         cropped_bytes = await loop.run_in_executor(
@@ -276,111 +374,95 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Crop failed")
         cropped_bytes = image_bytes
 
-    qr_url = None
-    try:
-        qr_url = await loop.run_in_executor(
-            None, receipt_image.extract_qr_url, image_bytes
-        )
-        logger.info("QR from original: %s", qr_url)
+    qr_url = await _decode_qr(loop, image_bytes, cropped_bytes)
+
+    if pending:
         if not qr_url:
-            qr_url = await loop.run_in_executor(
-                None, receipt_image.extract_qr_url, cropped_bytes
+            await status.edit_text(
+                "Sorry, I still couldn't read the QR code.\n\n"
+                "Please take a clear close-up of just the QR code and send it here.\n"
+                "I will use it to finish your previous receipt, and I won't keep the QR-only photo.\n\n"
+                "If you want to abandon that receipt, send /cancel_pending."
             )
-            logger.info("QR from cropped: %s", qr_url)
-    except Exception:
-        logger.exception("QR decode failed")
+            return
+
+        pending_image_id = pending.get("image_file_id")
+        if not pending_image_id:
+            await db.delete_pending_receipt(uid)
+            await status.edit_text(
+                "The pending receipt expired. Please send the full receipt again."
+            )
+            return
+
+        try:
+            pending_image_bytes = await db.get_image(pending_image_id)
+        except Exception:
+            logger.exception("Failed to load pending receipt image")
+            await db.delete_pending_receipt(uid)
+            await status.edit_text(
+                "I lost the earlier receipt image. Please send the full receipt again."
+            )
+            return
+
+        await status.edit_text("QR found. Finishing your previous receipt...")
+        message, saved = await _save_verified_receipt(
+            uid=uid,
+            source_image_bytes=pending_image_bytes,
+            qr_url=qr_url,
+            loop=loop,
+        )
+        await db.delete_pending_receipt(uid)
+        if saved:
+            message += "\n\nI used your QR close-up to verify the earlier receipt image."
+        await status.edit_text(message)
+        return
 
     if not qr_url:
-        preview = {}
         try:
-            preview = await loop.run_in_executor(
-                None, receipt_ocr.extract_receipt_preview, cropped_bytes
+            classification = await loop.run_in_executor(
+                None, receipt_ocr.classify_document, cropped_bytes
             )
         except Exception:
-            logger.exception("OCR preview failed")
-        if preview:
-            await status.edit_text(_format_ocr_preview(preview))
+            logger.exception("Receipt classification failed")
+            classification = {"kind": "unknown"}
+
+        if classification.get("kind") == "payment_slip":
+            vendor = classification.get("vendor") or "this merchant"
+            await status.edit_text(
+                "This looks like a bank card payment slip, not a fiscal VAT receipt.\n\n"
+                f"Merchant: {vendor}\n"
+                "Please send the fiscal receipt from the merchant with the tax QR code."
+            )
             return
+
+        file_name = (
+            msg.document.file_name
+            if msg.document and msg.document.file_name
+            else f"pending_receipt_{uid}.png"
+        )
+        await db.save_pending_receipt(uid, cropped_bytes, file_name)
         await status.edit_text(
-            "Could not read the QR code - the photo resolution is too low.\n\n"
-            "Please resend as a file (not a photo):\n"
-            "  - Tap the paperclip -> File -> choose your image\n"
-            "  - This keeps full resolution and the QR will decode correctly."
+            "Sorry, I couldn't read the QR code from this receipt.\n\n"
+            "Please take a clear close-up photo of just the QR code and send it here.\n"
+            "I will use that QR image to finish this receipt, and I won't keep the QR-only photo.\n\n"
+            "For best results, send the close-up as a file instead of a compressed photo."
         )
         return
 
     await status.edit_text("QR found. Fetching verified data from soliq.uz...")
-
-    data = await soliq.fetch_receipt_data(qr_url)
-    if not data:
-        preview = {}
-        try:
-            preview = await loop.run_in_executor(
-                None, receipt_ocr.extract_receipt_preview, cropped_bytes
-            )
-        except Exception:
-            logger.exception("OCR preview after soliq failure failed")
-        if preview:
-            await status.edit_text(
-                _format_ocr_preview(
-                    preview,
-                    intro="I read the QR code but couldn't verify the receipt on soliq.uz. OCR read this from the receipt:",
-                )
-            )
-            return
-        await status.edit_text(
-            "I read the QR code but could not fetch data from soliq.uz "
-            "(the page may be down, or this QR is not a soliq.uz fiscal link).\n"
-            f"QR content: {qr_url[:200]}"
-        )
-        return
-
-    printed_vendor = None
-    try:
-        printed_vendor = await loop.run_in_executor(
-            None, receipt_ocr.extract_printed_vendor, cropped_bytes
-        )
-    except Exception:
-        logger.exception("Printed vendor OCR failed")
-
-    display_vendor = printed_vendor or data.get("vendor", "")
-
-    file_id = await db.save_image(uid, cropped_bytes, f"receipt_{uid}.png")
-    receipt_doc = {
-        "telegram_id": uid,
-        "image_file_id": file_id,
-        "date": data.get("date", ""),
-        "vendor": data.get("vendor", ""),
-        "printed_vendor": printed_vendor or "",
-        "display_vendor": display_vendor,
-        "receipt_number": data.get("receipt_number", ""),
-        "vat_amount": data.get("vat_amount", 0.0),
-        "total_amount": data.get("total_amount", 0.0),
-        "soliq_url": qr_url,
-        "raw_qr": qr_url,
-    }
-    inserted = await db.save_receipt(receipt_doc)
-    if inserted is None:
-        await status.edit_text(
-            f"This receipt (#{data.get('receipt_number')}) is already in your records."
-        )
-        return
-
-    count = await db.count_receipts(uid)
-    await status.edit_text(
-        f"Receipt added (#{count})\n\n"
-        f"Vendor: {display_vendor or '-'}\n"
-        f"Date: {data.get('date', '-')}\n"
-        f"Receipt #: {data.get('receipt_number', '-')}\n"
-        f"Total: {data.get('total_amount', 0):,.2f} UZS\n"
-        f"VAT: {data.get('vat_amount', 0):,.2f} UZS\n"
-        "Verified tax data source: soliq.uz"
+    message, _ = await _save_verified_receipt(
+        uid=uid,
+        source_image_bytes=cropped_bytes,
+        qr_url=qr_url,
+        loop=loop,
     )
+    await status.edit_text(message)
 
 
 # ---------- App setup ----------
 
 async def _post_init(app: Application) -> None:
+    _clear_local_cache_dirs()
     me = await app.bot.get_me()
     logger.info("Connected to Telegram as @%s", me.username)
     logger.info(
@@ -394,6 +476,9 @@ async def _post_init(app: Application) -> None:
         try:
             await db.ping()
             await db.ensure_indexes()
+            deleted = await db.cleanup_orphaned_images()
+            if deleted:
+                logger.info("Deleted %s orphaned GridFS image(s).", deleted)
             logger.info("MongoDB reachable and indexes ensured.")
             return
         except Exception:
@@ -426,6 +511,7 @@ def main() -> None:
     app.add_handler(CommandHandler("export_vat", cmd_export_vat))
     app.add_handler(CommandHandler("export_pdf", cmd_export_pdf))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("cancel_pending", cmd_cancel_pending))
 
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))

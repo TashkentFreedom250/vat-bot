@@ -67,6 +67,41 @@ _COMPANY_HINTS = (
 _DATE_RE = re.compile(r"(\d{2})[-./](\d{2})[-./](\d{4})(?:\s*\d{2}:\d{2}(?::\d{2})?)?")
 _MONEY_RE = re.compile(r"(-?[\d\s]+(?:[.,]\d{2})|[\d\s]+(?:[.,]\d{3})+(?:[.,]\d{2})?)")
 _RECEIPT_NO_RE = re.compile(r"\b\d{3,18}\b")
+_PAYMENT_SLIP_HINTS = (
+    "оплата",
+    "omnara",
+    "ornata",
+    "somnara",
+    "odobreno",
+    "одобрено",
+    "ono6peho",
+    "ono6peno",
+    "komissiya",
+    "комиссия",
+    "komnccua",
+    "код ответа",
+    "kod otveta",
+    "kodotbeta",
+    "aip:1800",
+    "tvr:",
+    "tsi:",
+    "mastercard",
+    "visa",
+    "mtogo",
+    "итого",
+)
+_FISCAL_RECEIPT_HINTS = (
+    "savdo",
+    "qqs",
+    "mxik",
+    "shtrix",
+    "keshbek",
+    "fiskal inzo",
+    "savdo raqami",
+    "chek",
+    "naqd",
+    "naqdsiz",
+)
 
 
 def extract_printed_vendor(image_bytes: bytes) -> Optional[str]:
@@ -104,6 +139,18 @@ def extract_receipt_preview(image_bytes: bytes) -> dict:
         "vat_hint": _format_vat_hint(vat_amount, vat_rate),
     }
     return {key: value for key, value in preview.items() if value not in (None, "", [])}
+
+
+def classify_document(image_bytes: bytes) -> dict:
+    img = _downscale_for_ocr(_to_cv(image_bytes))
+    if img.size == 0:
+        return {"kind": "unknown"}
+
+    lines = _ocr_lines(img)
+    if not lines:
+        return {"kind": "unknown"}
+
+    return _classify_lines(lines, image_height=img.shape[0])
 
 
 def _get_engine():
@@ -422,3 +469,43 @@ def _format_vat_hint(vat_amount: Optional[float], vat_rate: Optional[str]) -> st
     if vat_amount is None:
         return ""
     return f"{vat_amount:,.2f} UZS"
+
+
+def _normalize_for_match(text: str) -> str:
+    text = _clean_text(text).lower()
+    return re.sub(r"[^a-z0-9а-яё%' ]+", " ", text)
+
+
+def _classify_lines(lines: list[dict], image_height: int) -> dict:
+    joined = " ".join(_normalize_for_match(line["text"]) for line in lines)
+    payment_hits = sum(1 for hint in _PAYMENT_SLIP_HINTS if hint in joined)
+    fiscal_hits = sum(1 for hint in _FISCAL_RECEIPT_HINTS if hint in joined)
+    vendor = _extract_vendor_from_lines(lines, image_height=image_height)
+    card_slip_pattern = (
+        any(hint in joined for hint in ("aip:1800", "tvr:", "tsi"))
+        and any(hint in joined for hint in ("mastercard", "visa"))
+        and any(hint in joined for hint in ("ono6peho", "ono6peno", "mtogo", "komnccua", "omnara", "ornata", "somnara"))
+    )
+
+    if (payment_hits >= 2 and fiscal_hits == 0) or (card_slip_pattern and fiscal_hits == 0):
+        return {
+            "kind": "payment_slip",
+            "vendor": vendor or "",
+            "payment_hits": payment_hits,
+            "fiscal_hits": fiscal_hits,
+        }
+
+    if fiscal_hits >= 2:
+        return {
+            "kind": "fiscal_receipt",
+            "vendor": vendor or "",
+            "payment_hits": payment_hits,
+            "fiscal_hits": fiscal_hits,
+        }
+
+    return {
+        "kind": "unknown",
+        "vendor": vendor or "",
+        "payment_hits": payment_hits,
+        "fiscal_hits": fiscal_hits,
+    }

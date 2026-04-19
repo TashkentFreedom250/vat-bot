@@ -1,6 +1,7 @@
 import unittest
 
 from src.receipt_ocr import (
+    _classify_lines,
     _extract_date_from_lines,
     _extract_total_from_lines,
     _extract_vat_rate_from_lines,
@@ -45,6 +46,28 @@ class ReceiptOCRTests(unittest.TestCase):
         ]
 
         self.assertEqual(_extract_date_from_lines(lines), "2026-04-03")
+
+    def test_classifies_payment_slip(self) -> None:
+        lines = [
+            {"text": "Оплата", "score": 0.95, "top": 400.0, "left": 10.0},
+            {"text": "Одобрено", "score": 0.95, "top": 430.0, "left": 10.0},
+            {"text": "Код ответа", "score": 0.95, "top": 460.0, "left": 10.0},
+            {"text": "MASTERCARD", "score": 0.95, "top": 490.0, "left": 10.0},
+        ]
+
+        result = _classify_lines(lines, image_height=1200)
+        self.assertEqual(result["kind"], "payment_slip")
+
+    def test_classifies_fiscal_receipt(self) -> None:
+        lines = [
+            {"text": "Savdo", "score": 0.95, "top": 400.0, "left": 10.0},
+            {"text": "QQS siz", "score": 0.95, "top": 430.0, "left": 10.0},
+            {"text": "MXIK", "score": 0.95, "top": 460.0, "left": 10.0},
+            {"text": "Fiskal inzo", "score": 0.95, "top": 490.0, "left": 10.0},
+        ]
+
+        result = _classify_lines(lines, image_height=1200)
+        self.assertEqual(result["kind"], "fiscal_receipt")
 
 
 if __name__ == "__main__":
