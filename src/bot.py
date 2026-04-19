@@ -151,6 +151,14 @@ async def _save_verified_receipt(
             False,
         )
 
+    if not data.get("vat_amount"):
+        vendor = data.get("vendor", "") or data.get("receipt_number", "this receipt")
+        return (
+            f"This receipt ({vendor}) has 0 VAT — nothing to refund.\n"
+            "It will not be added to your records.",
+            False,
+        )
+
     printed_vendor = None
     try:
         printed_vendor = await loop.run_in_executor(
