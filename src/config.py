@@ -15,7 +15,7 @@ MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB = os.getenv("MONGODB_DB", "vat_bot")
 
 # Soliq.uz scraping
-SOLIQ_TIMEOUT = int(os.getenv("SOLIQ_TIMEOUT", "15"))
+SOLIQ_TIMEOUT = int(os.getenv("SOLIQ_TIMEOUT", "30"))
 MONGODB_SERVER_SELECTION_TIMEOUT_MS = int(
     os.getenv("MONGODB_SERVER_SELECTION_TIMEOUT_MS", "10000")
 )
