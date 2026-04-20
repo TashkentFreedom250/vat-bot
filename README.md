@@ -78,7 +78,6 @@ vat-bot/
 │   └── VAT_Refund.xlsx     # Official template
 ├── run_bot.sh              # One-command Mac setup & launcher
 ├── requirements.txt
-├── Dockerfile              # For containerized deployment
 ├── .env.example
 └── README.md
 ```

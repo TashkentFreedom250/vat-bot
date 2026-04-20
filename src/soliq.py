@@ -65,22 +65,14 @@ async def fetch_receipt_data(qr_url: str) -> Optional[dict]:
         if alt != qr_url:
             urls_to_try.append(alt)
 
-    def _make_fetch_url(target: str) -> str:
-        """Route through Cloudflare Worker proxy if SOLIQ_PROXY_URL is set."""
-        if config.SOLIQ_PROXY_URL:
-            from urllib.parse import quote
-            return f"{config.SOLIQ_PROXY_URL}?url={quote(target, safe='')}"
-        return target
-
     async with httpx.AsyncClient(
         timeout=config.SOLIQ_TIMEOUT,
         headers={"User-Agent": USER_AGENT, "Accept-Language": "uz,en;q=0.9,ru;q=0.8"},
         follow_redirects=True,
     ) as client:
         for url in urls_to_try:
-            fetch_url = _make_fetch_url(url)
             try:
-                resp = await client.get(fetch_url)
+                resp = await client.get(url)
             except Exception as exc:
                 logger.warning("soliq.uz fetch error for %s: %r", url, exc)
                 continue

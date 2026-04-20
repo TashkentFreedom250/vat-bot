@@ -16,13 +16,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shutil
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Thread
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -52,51 +48,8 @@ _executor = ThreadPoolExecutor(
 )
 
 
-class _HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802 - stdlib method name
-        body = b"ok\n"
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, format: str, *args) -> None:  # noqa: A003 - stdlib signature
-        return
-
-
-def _start_health_server() -> None:
-    port = os.getenv("PORT")
-    if not port:
-        return
-
-    try:
-        server = ThreadingHTTPServer(("0.0.0.0", int(port)), _HealthHandler)
-    except OSError:
-        logger.exception("Failed to bind healthcheck server on PORT=%s", port)
-        raise
-
-    thread = Thread(target=server.serve_forever, name="healthcheck-server", daemon=True)
-    thread.start()
-    logger.info("Healthcheck server listening on PORT=%s", port)
-
-
 async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Unhandled exception while processing an update.", exc_info=ctx.error)
-
-
-def _clear_local_cache_dirs() -> None:
-    for path in (config.TMP_DIR, Path("debug_images")):
-        if not path.exists():
-            continue
-        for child in path.iterdir():
-            try:
-                if child.is_dir():
-                    shutil.rmtree(child)
-                else:
-                    child.unlink()
-            except Exception:
-                logger.exception("Failed to remove cache path: %s", child)
 
 
 def _display_vendor(doc: dict) -> str:
@@ -549,7 +502,6 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _post_init(app: Application) -> None:
     asyncio.get_running_loop().set_default_executor(_executor)
-    _clear_local_cache_dirs()
     me = await app.bot.get_me()
     logger.info("Connected to Telegram as @%s", me.username)
     logger.info(
@@ -576,12 +528,7 @@ async def _post_init(app: Application) -> None:
 
 
 def main() -> None:
-    logger.info(
-        "Starting VAT bot. Railway service=%s environment=%s",
-        os.getenv("RAILWAY_SERVICE_NAME", ""),
-        os.getenv("RAILWAY_ENVIRONMENT_NAME", ""),
-    )
-    _start_health_server()
+    logger.info("Starting VAT bot (local Mac host).")
     app = (
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)

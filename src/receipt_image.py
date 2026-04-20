@@ -11,6 +11,7 @@ import numpy as np
 import zxingcpp
 from PIL import Image
 from pillow_heif import register_heif_opener
+from pyzbar import pyzbar
 
 register_heif_opener()
 
@@ -239,11 +240,29 @@ def _decode_with_zxing(img: np.ndarray) -> list[str]:
     return results
 
 
+def _decode_with_pyzbar(img: np.ndarray) -> list[str]:
+    """pyzbar (libzbar) often reads blurry phone shots that zxing/opencv miss."""
+    try:
+        decoded = pyzbar.decode(img, symbols=[pyzbar.ZBarSymbol.QRCODE])
+    except Exception:
+        return []
+    results: list[str] = []
+    for sym in decoded:
+        try:
+            text = sym.data.decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        if text:
+            results.append(text)
+    return results
+
+
 def _decode_image(img: np.ndarray) -> list[str]:
     """Try several QR decoders and return unique payloads."""
     results = []
     _append_unique(results, _decode_with_opencv(img))
     _append_unique(results, _decode_with_zxing(img))
+    _append_unique(results, _decode_with_pyzbar(img))
     return results
 
 
@@ -270,15 +289,31 @@ def _candidate_regions(img: np.ndarray, aggressive: bool) -> list[np.ndarray]:
     return regions
 
 
+def _lab_normalized(region: np.ndarray) -> np.ndarray:
+    """CLAHE on the L channel of LAB — evens out shadows from phone photos
+    without crushing QR contrast like grayscale CLAHE can."""
+    lab = cv2.cvtColor(region, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l)
+    return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
+
 def _variant_groups(
     region: np.ndarray, aggressive: bool, low_quality: bool
 ) -> list[np.ndarray]:
     gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
     sharp = cv2.addWeighted(clahe, 1.6, cv2.GaussianBlur(clahe, (0, 0), 2), -0.6, 0)
+    lab_norm = _lab_normalized(region)
 
     if not aggressive:
-        variants: list[np.ndarray] = [region, _with_border(region), clahe, _with_border(clahe)]
+        variants: list[np.ndarray] = [
+            region,
+            _with_border(region),
+            lab_norm,
+            clahe,
+            _with_border(clahe),
+        ]
         if low_quality:
             variants.extend(
                 [
@@ -318,6 +353,16 @@ def _soliq_payload(found: list[str]) -> Optional[str]:
     return None
 
 
+def _rotations(img: np.ndarray) -> list[np.ndarray]:
+    """The four cardinal rotations of an image — phone shots come in at any angle."""
+    return [
+        img,
+        cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE),
+        cv2.rotate(img, cv2.ROTATE_180),
+        cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE),
+    ]
+
+
 def extract_qr_url(image_bytes: bytes) -> Optional[str]:
     """
     Decode QR codes from the image and return the soliq.uz URL.
@@ -326,8 +371,17 @@ def extract_qr_url(image_bytes: bytes) -> Optional[str]:
     We only ever return the soliq.uz one — if none is found, return None
     so the caller can tell the user no fiscal QR was detected.
     """
-    img = _downscale_for_decode(_to_cv(image_bytes))
+    native = _to_cv(image_bytes)
+    # Fast path: native resolution. High-res photos from phones often only
+    # decode cleanly at their original pixel density.
     found: list[str] = []
+    _append_unique(found, _decode_with_pyzbar(native))
+    _append_unique(found, _decode_with_zxing(native))
+    soliq = _soliq_payload(found)
+    if soliq:
+        return soliq
+
+    img = _downscale_for_decode(native)
     aggressive = len(image_bytes) < 250_000 or min(img.shape[:2]) < 1000
     low_quality = aggressive
 
@@ -340,5 +394,15 @@ def extract_qr_url(image_bytes: bytes) -> Optional[str]:
                 soliq = _soliq_payload(found)
                 if soliq:
                     return soliq
+
+    # Last-ditch: rotate the full image 90/180/270° and retry. Phones mount
+    # receipts at any angle; most decoders try rotation internally but miss
+    # edge cases — especially pyzbar on portrait shots.
+    for rotated in _rotations(img)[1:]:
+        _append_unique(found, _decode_with_pyzbar(rotated))
+        _append_unique(found, _decode_with_zxing(rotated))
+        soliq = _soliq_payload(found)
+        if soliq:
+            return soliq
 
     return None
