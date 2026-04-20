@@ -240,8 +240,24 @@ def _decode_with_zxing(img: np.ndarray) -> list[str]:
     return results
 
 
+_PYZBAR_MAX_DIM = 2000
+
+
 def _decode_with_pyzbar(img: np.ndarray) -> list[str]:
-    """pyzbar (libzbar) often reads blurry phone shots that zxing/opencv miss."""
+    """pyzbar (libzbar) often reads blurry phone shots that zxing/opencv miss.
+
+    libzbar is a C library that segfaults on very large inputs on macOS —
+    we bound the input to _PYZBAR_MAX_DIM on its longest side.
+    """
+    h, w = img.shape[:2]
+    longest = max(h, w)
+    if longest > _PYZBAR_MAX_DIM:
+        scale = _PYZBAR_MAX_DIM / longest
+        img = cv2.resize(
+            img,
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
     try:
         decoded = pyzbar.decode(img, symbols=[pyzbar.ZBarSymbol.QRCODE])
     except Exception:
@@ -372,11 +388,13 @@ def extract_qr_url(image_bytes: bytes) -> Optional[str]:
     so the caller can tell the user no fiscal QR was detected.
     """
     native = _to_cv(image_bytes)
-    # Fast path: native resolution. High-res photos from phones often only
-    # decode cleanly at their original pixel density.
+    # Fast path: higher-than-default resolution. High-res phone photos
+    # often only resolve at closer to their original pixel density, but
+    # running at full 12MP risks libzbar segfaults and is slow.
     found: list[str] = []
-    _append_unique(found, _decode_with_pyzbar(native))
-    _append_unique(found, _decode_with_zxing(native))
+    hires = _downscale_for_decode(native, max_dim=2500)
+    _append_unique(found, _decode_with_pyzbar(hires))
+    _append_unique(found, _decode_with_zxing(hires))
     soliq = _soliq_payload(found)
     if soliq:
         return soliq
