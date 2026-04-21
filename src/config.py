@@ -16,6 +16,11 @@ MONGODB_DB = os.getenv("MONGODB_DB", "vat_bot")
 
 # Soliq.uz scraping
 SOLIQ_TIMEOUT = int(os.getenv("SOLIQ_TIMEOUT", "30"))
+# Optional proxy for soliq.uz calls — use when the Mac's WiFi can't reach
+# ofd.soliq.uz (e.g., ISP block). Point at a proxy that *can* (typically a
+# proxy running on the user's phone over USB/hotspot). httpx-compatible:
+#   http://user:pass@host:port   https://...   socks5://host:port
+SOLIQ_PROXY = os.getenv("SOLIQ_PROXY", "").strip() or None
 MONGODB_SERVER_SELECTION_TIMEOUT_MS = int(
     os.getenv("MONGODB_SERVER_SELECTION_TIMEOUT_MS", "10000")
 )

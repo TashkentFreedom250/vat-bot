@@ -114,3 +114,10 @@ This gives the **authoritative** VAT amount straight from the tax authority — 
 - **soliq.uz availability**: if soliq.uz is down, the bot tells the user and doesn't save a broken record.
 - **Privacy**: receipts are stored per Telegram user ID. Only you can see your receipts.
 - **Geo-blocking**: the bot must run on a machine with a Uzbekistan IP. Cloud providers (AWS, Railway, Render, Fly.io) are blocked.
+- **WiFi can't reach soliq.uz?** Some local WiFi ISPs block `ofd.soliq.uz` even inside Uzbekistan. Workarounds:
+  1. **Easiest** — connect the Mac to your phone's cellular hotspot (or USB tether) and keep the bot running. No config change needed.
+  2. **Mixed network** — set `SOLIQ_PROXY` in `.env` to an HTTP/HTTPS proxy reachable from the Mac. The bot will send *only* soliq.uz traffic through the proxy while WiFi handles Telegram/MongoDB:
+     ```
+     SOLIQ_PROXY=http://127.0.0.1:8888
+     ```
+     (For `socks5://...` also run `pip install httpx[socks]`.)

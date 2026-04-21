@@ -78,11 +78,15 @@ async def fetch_receipt_with_diag(qr_url: str) -> tuple[Optional[dict], str]:
     bad_statuses: list[int] = []
     parsed_but_empty = 0
 
-    async with httpx.AsyncClient(
+    client_kwargs = dict(
         timeout=config.SOLIQ_TIMEOUT,
         headers={"User-Agent": USER_AGENT, "Accept-Language": "uz,en;q=0.9,ru;q=0.8"},
         follow_redirects=True,
-    ) as client:
+    )
+    if config.SOLIQ_PROXY:
+        client_kwargs["proxy"] = config.SOLIQ_PROXY
+
+    async with httpx.AsyncClient(**client_kwargs) as client:
         for url in urls_to_try:
             try:
                 resp = await client.get(url)
