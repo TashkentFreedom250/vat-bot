@@ -40,8 +40,14 @@ USER_AGENT = (
 
 async def fetch_receipt_data(qr_url: str) -> Optional[dict]:
     """Fetch and parse a soliq.uz receipt page from a QR URL."""
+    result, _ = await fetch_receipt_with_diag(qr_url)
+    return result
+
+
+async def fetch_receipt_with_diag(qr_url: str) -> tuple[Optional[dict], str]:
+    """Like fetch_receipt_data but also returns a human-readable failure reason."""
     if not qr_url:
-        return None
+        return None, "Empty QR URL."
 
     try:
         qs = parse_qs(urlparse(qr_url).query)
@@ -50,20 +56,27 @@ async def fetch_receipt_data(qr_url: str) -> Optional[dict]:
 
     terminal = (qs.get("t") or [None])[0]
     receipt = (qs.get("r") or [None])[0]
-    date_param = (qs.get("c") or [None])[0]
-    amount_param = (qs.get("s") or [None])[0]
+    date_param = (qs.get("c") or [None])[0] or ""
+    amount_param = (qs.get("s") or [None])[0] or ""
     fallback_date = _date_from_qr_param(qr_url)
 
-    # Build a deduplicated list of URLs to try.
-    # We only add the /api/check variant if it differs from qr_url.
+    # Try the QR URL as-is, then common endpoint variants. soliq.uz has
+    # shipped several paths over the years; receipts in the wild carry any
+    # of /check, /epul/, or the bare root form.
     urls_to_try: list[str] = [qr_url]
     if terminal and receipt:
-        alt = (
-            f"https://ofd.soliq.uz/api/check"
-            f"?t={terminal}&r={receipt}&c={date_param}&s={amount_param}"
-        )
-        if alt != qr_url:
-            urls_to_try.append(alt)
+        qs_str = f"t={terminal}&r={receipt}&c={date_param}&s={amount_param}"
+        for variant in (
+            f"https://ofd.soliq.uz/api/check?{qs_str}",
+            f"https://ofd.soliq.uz/check?{qs_str}",
+            f"https://ofd.soliq.uz/epul/?{qs_str}",
+        ):
+            if variant not in urls_to_try:
+                urls_to_try.append(variant)
+
+    network_errors = 0
+    bad_statuses: list[int] = []
+    parsed_but_empty = 0
 
     async with httpx.AsyncClient(
         timeout=config.SOLIQ_TIMEOUT,
@@ -74,39 +87,64 @@ async def fetch_receipt_data(qr_url: str) -> Optional[dict]:
             try:
                 resp = await client.get(url)
             except Exception as exc:
+                network_errors += 1
                 logger.warning("soliq.uz fetch error for %s: %r", url, exc)
                 continue
 
             if resp.status_code != 200:
+                bad_statuses.append(resp.status_code)
                 logger.warning("soliq.uz returned HTTP %s for %s", resp.status_code, url)
                 continue
 
             content_type = resp.headers.get("content-type", "")
+            body = resp.text
             logger.info(
                 "soliq.uz %s → %s, content-type=%s, len=%s",
-                url, resp.status_code, content_type, len(resp.text),
+                url, resp.status_code, content_type, len(body),
             )
 
-            # Try JSON first (some terminals return application/json)
-            if "application/json" in content_type:
+            # Sniff JSON by content-type OR by body shape (some endpoints
+            # return JSON with text/html on this host).
+            looks_json = "application/json" in content_type or body.lstrip().startswith(("{", "["))
+            if looks_json:
                 try:
                     data = resp.json()
+                except Exception:
+                    try:
+                        import json as _json
+                        data = _json.loads(body)
+                    except Exception as exc:
+                        logger.warning("JSON parse failed for %s: %s", url, exc)
+                        data = None
+                if data is not None:
                     normalized = _normalize_json(data, terminal or "", receipt or "")
                     if normalized:
-                        return normalized
-                except Exception as exc:
-                    logger.warning("JSON parse failed: %s", exc)
+                        return normalized, "ok"
 
-            # Fall back to HTML scraping
             try:
-                result = _parse_html(resp.text, qr_url, fallback_date=fallback_date)
-                if result:
-                    return result
+                parsed = _parse_html(body, qr_url, fallback_date=fallback_date)
+                if parsed:
+                    return parsed, "ok"
+                parsed_but_empty += 1
             except Exception as exc:
                 logger.warning("HTML parse error for %s: %s", url, exc)
 
     logger.warning("fetch_receipt_data: all attempts failed for %s", qr_url)
-    return None
+    if network_errors and not bad_statuses and not parsed_but_empty:
+        diag = (
+            "I couldn't reach ofd.soliq.uz from this computer — check the "
+            "internet connection. (This machine must be on an Uzbekistan ISP.)"
+        )
+    elif bad_statuses and not parsed_but_empty:
+        diag = f"soliq.uz returned HTTP {bad_statuses[0]} for every attempt."
+    elif parsed_but_empty:
+        diag = (
+            "soliq.uz loaded the page but I couldn't read VAT/total from it. "
+            "The page layout may have changed."
+        )
+    else:
+        diag = "All soliq.uz attempts failed for an unknown reason."
+    return None, diag
 
 
 def _normalize_json(data: dict, terminal: str, receipt: str) -> Optional[dict]:

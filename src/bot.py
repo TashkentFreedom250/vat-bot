@@ -104,11 +104,11 @@ async def _save_verified_receipt(
     loop: asyncio.AbstractEventLoop,
     qr_image_bytes: bytes | None = None,
 ) -> tuple[str, bool]:
-    data = await soliq.fetch_receipt_data(qr_url)
+    data, diag = await soliq.fetch_receipt_with_diag(qr_url)
     if not data:
         return (
-            "I read the QR code but could not fetch data from soliq.uz "
-            "(the page may be down, or this QR is not a soliq.uz fiscal link).\n"
+            f"I read the QR code but could not fetch data from soliq.uz.\n\n"
+            f"Reason: {diag}\n"
             f"QR content: {qr_url[:200]}",
             False,
         )
