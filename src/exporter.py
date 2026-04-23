@@ -78,16 +78,30 @@ async def build_xlsx(telegram_id: int, employee_name: str, output_path: Path) ->
         # Write employee name directly (D5 is the top-left of the D5:E5 merged cell)
         ws.cell(row=NAME_ROW, column=NAME_COL, value=employee_name)
 
-        # Write receipt rows
+        # Write receipt rows. We explicitly write column A (sequential #) because
+        # the template's pre-filled numbers display with a broken number format
+        # on some Excel versions (showing "0000000000" for mid-range rows).
+        # Use plain integers with "General" format to guarantee a clean render.
         sheet_total = 0.0
         for i, r in enumerate(chunk):
             row = DATA_START_ROW + i
+            seq = idx * ROWS_PER_SHEET + i + 1
+            num_cell = ws.cell(row=row, column=1, value=seq)
+            num_cell.number_format = "General"
             ws.cell(row=row, column=2, value=r.get("date", ""))
             ws.cell(row=row, column=3, value=_display_vendor(r))
             ws.cell(row=row, column=4, value=r.get("receipt_number", ""))
             vat = float(r.get("vat_amount") or 0)
             ws.cell(row=row, column=5, value=vat)
             sheet_total += vat
+
+        # Blank out any leftover rows in this sheet's data block so old
+        # template numbers (1-30) don't leak through when the chunk is short.
+        for i in range(len(chunk), ROWS_PER_SHEET):
+            row = DATA_START_ROW + i
+            for col in range(1, 6):
+                cell = ws.cell(row=row, column=col)
+                cell.value = None
 
         # Write per-sheet total as a value (E40), replacing the formula
         ws.cell(row=PER_SHEET_TOTAL_ROW, column=PER_SHEET_TOTAL_COL, value=sheet_total)
@@ -101,9 +115,17 @@ async def build_xlsx(telegram_id: int, employee_name: str, output_path: Path) ->
     return output_path
 
 
+_PDF_DPI = 180  # sharp enough to read receipt text; keeps files small
+_PDF_JPEG_QUALITY = 78
+
+
 def _draw_pil(c, pil_img: "Image.Image", box_x: float, box_y: float,
               box_w: float, box_h: float) -> None:
-    """Draw a PIL image scaled to fit and centered inside the given box."""
+    """Draw a PIL image scaled to fit and centered inside the given box.
+
+    Downscales and JPEG-encodes so PDFs stay under Telegram's 50 MB cap —
+    receipts packed with full-res PNG pages balloon fast.
+    """
     from reportlab.lib.utils import ImageReader
     iw, ih = pil_img.size
     if iw == 0 or ih == 0:
@@ -112,10 +134,18 @@ def _draw_pil(c, pil_img: "Image.Image", box_x: float, box_y: float,
     dw, dh = iw * ratio, ih * ratio
     dx = box_x + (box_w - dw) / 2
     dy = box_y + (box_h - dh) / 2
+
+    # Downscale to the printed size at _PDF_DPI. reportlab draws in points
+    # (72/inch), so target-pixel = drawn_points * DPI / 72.
+    target_w = max(1, int(dw * _PDF_DPI / 72))
+    if target_w < iw:
+        target_h = max(1, int(ih * target_w / iw))
+        pil_img = pil_img.resize((target_w, target_h), Image.LANCZOS)
+
     buf = BytesIO()
-    pil_img.save(buf, format="PNG")
+    pil_img.save(buf, format="JPEG", quality=_PDF_JPEG_QUALITY, optimize=True)
     buf.seek(0)
-    c.drawImage(ImageReader(buf), dx, dy, width=dw, height=dh, mask="auto")
+    c.drawImage(ImageReader(buf), dx, dy, width=dw, height=dh)
 
 
 def _strip_coverage(n_cols: int, iw: int, ih: int,
@@ -177,27 +207,96 @@ def _draw_receipt_images(
         _draw_pil(c, strip, x + i * (col_w + gap), y, col_w, max_h)
 
 
-async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> Path:
-    """
-    Generate a PDF with one receipt image per page, plus a header summary.
-    """
-    receipts = await db.list_receipts(telegram_id)
+# Cap per-PDF receipt count to stay safely under Telegram's 50 MB upload
+# limit even when users have lots of long receipts.
+RECEIPTS_PER_PDF = 30
 
+
+async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> Path:
+    """Back-compat single-file PDF builder. Prefer build_pdfs for large sets."""
+    paths = await build_pdfs(telegram_id, employee_name, output_path.parent, output_path.stem)
+    # When only one file was produced, rename it to match the requested name.
+    if len(paths) == 1 and paths[0] != output_path:
+        paths[0].rename(output_path)
+        return output_path
+    return paths[0]
+
+
+async def build_pdfs(
+    telegram_id: int,
+    employee_name: str,
+    output_dir: Path,
+    name_prefix: str = "Receipts",
+) -> list[Path]:
+    """Generate one or more PDFs (split every RECEIPTS_PER_PDF receipts)."""
+    receipts = await db.list_receipts(telegram_id)
+    if not receipts:
+        return []
+
+    chunks = [
+        receipts[i : i + RECEIPTS_PER_PDF]
+        for i in range(0, len(receipts), RECEIPTS_PER_PDF)
+    ]
+    total_vat_all = sum(float(r.get("vat_amount") or 0) for r in receipts)
+    total_parts = len(chunks)
+    out_paths: list[Path] = []
+
+    for part_idx, chunk in enumerate(chunks, 1):
+        global_offset = (part_idx - 1) * RECEIPTS_PER_PDF
+        suffix = f"_part{part_idx}_of_{total_parts}" if total_parts > 1 else ""
+        out_path = output_dir / f"{name_prefix}{suffix}.pdf"
+        await _write_pdf_chunk(
+            chunk=chunk,
+            employee_name=employee_name,
+            part_idx=part_idx,
+            total_parts=total_parts,
+            global_offset=global_offset,
+            grand_total_vat=total_vat_all,
+            total_receipts=len(receipts),
+            output_path=out_path,
+        )
+        out_paths.append(out_path)
+
+    return out_paths
+
+
+async def _write_pdf_chunk(
+    *,
+    chunk: list[dict],
+    employee_name: str,
+    part_idx: int,
+    total_parts: int,
+    global_offset: int,
+    grand_total_vat: float,
+    total_receipts: int,
+    output_path: Path,
+) -> None:
     c = canvas.Canvas(str(output_path), pagesize=A4)
     width, height = A4
     margin = 15 * mm
 
     # --- Cover / summary page ---
+    title = "VAT Refund – Receipt Package"
+    if total_parts > 1:
+        title += f"  (Part {part_idx} of {total_parts})"
     c.setFont("Helvetica-Bold", 16)
-    c.drawString(margin, height - margin - 10 * mm, "VAT Refund – Receipt Package")
+    c.drawString(margin, height - margin - 10 * mm, title)
     c.setFont("Helvetica", 11)
     c.drawString(margin, height - margin - 18 * mm, f"Employee: {employee_name or '—'}")
-    c.drawString(margin, height - margin - 24 * mm, f"Total receipts: {len(receipts)}")
-    total_vat = sum(float(r.get("vat_amount") or 0) for r in receipts)
-    c.drawString(margin, height - margin - 30 * mm, f"Total VAT (UZS): {total_vat:,.2f}")
+    c.drawString(
+        margin, height - margin - 24 * mm,
+        f"Receipts in this file: {len(chunk)} (#{global_offset + 1}–#{global_offset + len(chunk)} of {total_receipts})",
+    )
+    chunk_total = sum(float(r.get("vat_amount") or 0) for r in chunk)
+    c.drawString(margin, height - margin - 30 * mm, f"VAT in this file (UZS): {chunk_total:,.2f}")
+    if total_parts > 1:
+        c.drawString(margin, height - margin - 36 * mm, f"Grand total VAT across all parts: {grand_total_vat:,.2f} UZS")
+        summary_y = height - margin - 51 * mm
+    else:
+        summary_y = height - margin - 45 * mm
 
-    # Summary table
-    y = height - margin - 45 * mm
+    # Summary table for this chunk
+    y = summary_y
     c.setFont("Helvetica-Bold", 10)
     c.drawString(margin, y, "#")
     c.drawString(margin + 10 * mm, y, "Date")
@@ -210,12 +309,12 @@ async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> 
     c.line(margin, y, width - margin, y)
     y -= 5 * mm
     c.setFont("Helvetica", 9)
-    for i, r in enumerate(receipts, 1):
+    for i, r in enumerate(chunk, 1):
         if y < margin + 15 * mm:
             c.showPage()
             y = height - margin
             c.setFont("Helvetica", 9)
-        c.drawString(margin, y, str(i))
+        c.drawString(margin, y, str(global_offset + i))
         c.drawString(margin + 10 * mm, y, str(r.get("date", "") or ""))
         vendor = _display_vendor(r)[:32]
         c.drawString(margin + 35 * mm, y, vendor)
@@ -227,12 +326,12 @@ async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> 
     c.line(margin, y, width - margin, y)
     y -= 6 * mm
     c.setFont("Helvetica-Bold", 10)
-    c.drawString(margin + 100 * mm, y, "TOTAL")
-    c.drawRightString(margin + 185 * mm, y, f"{total_vat:,.2f}")
+    c.drawString(margin + 100 * mm, y, "SUBTOTAL" if total_parts > 1 else "TOTAL")
+    c.drawRightString(margin + 185 * mm, y, f"{chunk_total:,.2f}")
 
     # --- One page per receipt image ---
-    n_receipts = len(receipts)
-    for i, r in enumerate(receipts, 1):
+    for i, r in enumerate(chunk, 1):
+        global_i = global_offset + i
         file_id = r.get("image_file_id")
         if not file_id:
             continue
@@ -250,7 +349,7 @@ async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> 
 
         c.showPage()
         c.setFont("Helvetica-Bold", 12)
-        c.drawString(margin, height - margin, f"Receipt #{i}")
+        c.drawString(margin, height - margin, f"Receipt #{global_i}")
         c.setFont("Helvetica", 10)
         c.drawString(
             margin, height - margin - 6 * mm,
@@ -258,8 +357,7 @@ async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> 
             f"VAT: {float(r.get('vat_amount') or 0):,.2f} UZS",
         )
 
-        # Image box: from bottom margin up to just below the header
-        img_box_y = margin + 6 * mm  # leave room for page-number footer
+        img_box_y = margin + 6 * mm
         img_box_h = height - margin - 12 * mm - img_box_y
         img_box_w = width - 2 * margin
 
@@ -269,11 +367,9 @@ async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> 
             c.setFont("Helvetica-Oblique", 10)
             c.drawString(margin, height / 2, "[Image could not be rendered]")
 
-        # Footer: page number
         c.setFont("Helvetica", 8)
         c.setFillGray(0.5)
-        c.drawRightString(width - margin, margin / 2, f"Receipt {i} of {n_receipts}")
+        c.drawRightString(width - margin, margin / 2, f"Receipt {global_i} of {total_receipts}")
         c.setFillGray(0)
 
     c.save()
-    return output_path

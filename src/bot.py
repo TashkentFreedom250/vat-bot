@@ -265,16 +265,25 @@ async def cmd_export_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     user = await db.get_user(uid)
     name = (user or {}).get("name", "")
 
-    out_path = config.TMP_DIR / f"Receipts_{uid}_{uuid.uuid4().hex[:6]}.pdf"
-    await exporter.build_pdf(uid, name, out_path)
+    prefix = f"Receipts_{uid}_{uuid.uuid4().hex[:6]}"
+    paths = await exporter.build_pdfs(uid, name, config.TMP_DIR, name_prefix=prefix)
+    total_parts = len(paths)
 
-    with open(out_path, "rb") as f:
-        await update.message.reply_document(
-            document=f,
-            filename="Receipts.pdf",
-            caption=f"{count} receipt(s) packaged.",
-        )
-    out_path.unlink(missing_ok=True)
+    try:
+        for idx, path in enumerate(paths, 1):
+            if total_parts > 1:
+                filename = f"Receipts_part{idx}_of_{total_parts}.pdf"
+                caption = f"Part {idx} of {total_parts} ({count} receipts total)"
+            else:
+                filename = "Receipts.pdf"
+                caption = f"{count} receipt(s) packaged."
+            with open(path, "rb") as f:
+                await update.message.reply_document(
+                    document=f, filename=filename, caption=caption,
+                )
+    finally:
+        for path in paths:
+            path.unlink(missing_ok=True)
 
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
