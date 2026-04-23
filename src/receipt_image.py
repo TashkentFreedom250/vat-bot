@@ -229,7 +229,9 @@ def _decode_with_zxing(img: np.ndarray) -> list[str]:
                 img,
                 formats=zxingcpp.BarcodeFormat.QRCode,
                 try_rotate=True,
-                try_downscale=False,
+                # try_downscale lets zxing search multiple internal scales —
+                # this recovers QRs that are small-in-frame on good photos.
+                try_downscale=True,
                 try_invert=True,
                 binarizer=binarizer,
             )
