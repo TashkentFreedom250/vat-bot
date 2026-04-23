@@ -11,7 +11,6 @@ import numpy as np
 import zxingcpp
 from PIL import Image
 from pillow_heif import register_heif_opener
-from pyzbar import pyzbar
 
 register_heif_opener()
 
@@ -240,45 +239,11 @@ def _decode_with_zxing(img: np.ndarray) -> list[str]:
     return results
 
 
-_PYZBAR_MAX_DIM = 2000
-
-
-def _decode_with_pyzbar(img: np.ndarray) -> list[str]:
-    """pyzbar (libzbar) often reads blurry phone shots that zxing/opencv miss.
-
-    libzbar is a C library that segfaults on very large inputs on macOS —
-    we bound the input to _PYZBAR_MAX_DIM on its longest side.
-    """
-    h, w = img.shape[:2]
-    longest = max(h, w)
-    if longest > _PYZBAR_MAX_DIM:
-        scale = _PYZBAR_MAX_DIM / longest
-        img = cv2.resize(
-            img,
-            (max(1, int(w * scale)), max(1, int(h * scale))),
-            interpolation=cv2.INTER_AREA,
-        )
-    try:
-        decoded = pyzbar.decode(img, symbols=[pyzbar.ZBarSymbol.QRCODE])
-    except Exception:
-        return []
-    results: list[str] = []
-    for sym in decoded:
-        try:
-            text = sym.data.decode("utf-8", errors="ignore")
-        except Exception:
-            continue
-        if text:
-            results.append(text)
-    return results
-
-
 def _decode_image(img: np.ndarray) -> list[str]:
     """Try several QR decoders and return unique payloads."""
     results = []
     _append_unique(results, _decode_with_opencv(img))
     _append_unique(results, _decode_with_zxing(img))
-    _append_unique(results, _decode_with_pyzbar(img))
     return results
 
 
@@ -389,11 +354,9 @@ def extract_qr_url(image_bytes: bytes) -> Optional[str]:
     """
     native = _to_cv(image_bytes)
     # Fast path: higher-than-default resolution. High-res phone photos
-    # often only resolve at closer to their original pixel density, but
-    # running at full 12MP risks libzbar segfaults and is slow.
+    # often only resolve at closer to their original pixel density.
     found: list[str] = []
     hires = _downscale_for_decode(native, max_dim=2500)
-    _append_unique(found, _decode_with_pyzbar(hires))
     _append_unique(found, _decode_with_zxing(hires))
     soliq = _soliq_payload(found)
     if soliq:
@@ -415,9 +378,8 @@ def extract_qr_url(image_bytes: bytes) -> Optional[str]:
 
     # Last-ditch: rotate the full image 90/180/270° and retry. Phones mount
     # receipts at any angle; most decoders try rotation internally but miss
-    # edge cases — especially pyzbar on portrait shots.
+    # edge cases on extreme portrait shots.
     for rotated in _rotations(img)[1:]:
-        _append_unique(found, _decode_with_pyzbar(rotated))
         _append_unique(found, _decode_with_zxing(rotated))
         soliq = _soliq_payload(found)
         if soliq:
