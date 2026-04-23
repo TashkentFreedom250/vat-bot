@@ -56,6 +56,29 @@ def _display_vendor(doc: dict) -> str:
     return doc.get("display_vendor") or doc.get("printed_vendor") or doc.get("vendor") or ""
 
 
+def _qr_failure_message(*, retry: bool) -> str:
+    """User-facing message when we couldn't decode a QR. `retry` = the user
+    already sent a close-up and it still didn't work."""
+    lead = (
+        "Sorry, I still couldn't read the QR code."
+        if retry
+        else "Sorry, I couldn't read the QR code from this receipt."
+    )
+    return (
+        f"{lead}\n\n"
+        "Easiest fix — let your phone's camera do the reading:\n"
+        "  1. Open your phone's camera app (no need to take a photo)\n"
+        "  2. Point it at the QR code on the receipt\n"
+        "  3. Your phone shows a yellow/white banner with the link\n"
+        "  4. Long-press the banner → Share → pick this chat\n"
+        "  5. I'll pull the data automatically\n\n"
+        "Or:\n"
+        "• Send a clearer close-up photo of just the QR code\n"
+        "• /cancel_pending to discard this receipt\n\n"
+        f"Need help? Contact {config.SUPPORT_CONTACT}."
+    )
+
+
 def _format_ocr_preview(preview: dict, intro: str = "I couldn't verify the QR code, but OCR read this from the receipt:") -> str:
     lines = [
         intro,
@@ -109,7 +132,8 @@ async def _save_verified_receipt(
         return (
             f"I read the QR code but could not fetch data from soliq.uz.\n\n"
             f"Reason: {diag}\n"
-            f"QR content: {qr_url[:200]}",
+            f"QR content: {qr_url[:200]}\n\n"
+            f"Need help? Contact {config.SUPPORT_CONTACT}.",
             False,
         )
 
@@ -190,7 +214,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/export_pdf - download PDF with all receipts\n"
         "/cancel_pending - discard a receipt waiting for a QR close-up\n"
         "/reset - delete everything\n"
-        "/help - show this message"
+        "/help - show this message\n\n"
+        f"Need help? Contact {config.SUPPORT_CONTACT}."
     )
 
 
@@ -372,13 +397,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if pending:
         if not qr_url:
-            await status.edit_text(
-                "Sorry, I still couldn't read the QR code.\n\n"
-                "You can:\n"
-                "• Try another close-up photo of the QR code\n"
-                "• Paste the soliq.uz link — your phone's camera app may have already decoded it\n"
-                "• /cancel_pending to discard this receipt"
-            )
+            await status.edit_text(_qr_failure_message(retry=True))
             return
 
         pending_image_id = pending.get("image_file_id")
@@ -436,21 +455,20 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             if msg.document and msg.document.file_name
             else f"pending_receipt_{uid}.png"
         )
-        await db.save_pending_receipt(uid, cropped_bytes, file_name)
-        await status.edit_text(
-            "Sorry, I couldn't read the QR code from this receipt.\n\n"
-            "You can:\n"
-            "• Send a clear close-up photo of just the QR code\n"
-            "• Paste the soliq.uz link — your phone's camera app may have already scanned it\n"
-            "• /cancel_pending to discard this receipt\n\n"
-            "Close-up tip: send as a file (not a compressed photo) for best results."
-        )
+        # Save the ORIGINAL uncropped bytes. If auto-crop failed badly the
+        # cropped image may have clipped the QR or distorted the receipt —
+        # keeping the full-quality original preserves every pixel the user
+        # captured for later review or export.
+        await db.save_pending_receipt(uid, image_bytes, file_name)
+        await status.edit_text(_qr_failure_message(retry=False))
         return
 
     await status.edit_text("QR found. Fetching verified data from soliq.uz...")
+    # Save the ORIGINAL bytes (not the crop) so the stored receipt always
+    # has maximum detail. The crop is only a processing step for QR decode.
     message, _ = await _save_verified_receipt(
         uid=uid,
-        source_image_bytes=cropped_bytes,
+        source_image_bytes=image_bytes,
         qr_url=qr_url,
         loop=loop,
     )
@@ -470,8 +488,11 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "I'm waiting for:\n"
             "• A close-up photo of the QR code\n"
-            "• The soliq.uz link (paste from your phone's camera)\n"
-            "• /cancel_pending to discard this receipt"
+            "• The soliq.uz link — easiest way: open your phone's camera, "
+            "point at the QR, long-press the yellow URL banner → Share → "
+            "pick this chat. I'll read it automatically.\n"
+            "• /cancel_pending to discard this receipt\n\n"
+            f"Need help? Contact {config.SUPPORT_CONTACT}."
         )
         return
 

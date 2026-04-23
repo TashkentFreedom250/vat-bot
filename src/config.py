@@ -10,6 +10,10 @@ load_dotenv()
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
+# Human support contact shown in welcome + failure messages. Set this to
+# something clickable in Telegram ("@ShiraliDT") for best UX.
+SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "Shirali DT").strip()
+
 # MongoDB
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB = os.getenv("MONGODB_DB", "vat_bot")
