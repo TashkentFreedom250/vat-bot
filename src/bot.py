@@ -211,7 +211,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "  Tap paperclip -> File -> choose image\n\n"
         "I will auto-crop, read the QR, fetch VAT from soliq.uz, and store it.\n\n"
         "Commands:\n"
-        "/setname <your full name> - used in exports\n"
+        "/setname &lt;your full name&gt; - used in exports\n"
         "/list - show stored receipts\n"
         "/export_vat - download filled VAT_Refund.xlsx\n"
         "/export_pdf - download PDF with all receipts\n"
