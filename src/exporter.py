@@ -64,24 +64,24 @@ async def build_xlsx(telegram_id: int, employee_name: str, output_path: Path) ->
     wb = load_workbook(output_path)
 
     receipts = await db.list_receipts(telegram_id)
-    grand_total = 0.0
+    cumulative_total = 0.0
 
-    # Chunk receipts across sheets (30 per sheet), write data + per-sheet totals
+    # Walk every sheet in the template — even empty ones get the employee
+    # name so continuations stay identified. Per-sheet totals accumulate
+    # (E40 on each sheet = running total through that sheet) so the user
+    # can see the refund amount grow as they flip across tabs.
     for idx, sheet_name in enumerate(SHEETS_ORDER):
         if sheet_name not in wb.sheetnames:
             continue
         ws = wb[sheet_name]
         chunk = receipts[idx * ROWS_PER_SHEET : (idx + 1) * ROWS_PER_SHEET]
-        if not chunk and idx > 0:
-            continue
 
-        # Write employee name directly (D5 is the top-left of the D5:E5 merged cell)
+        # Employee name on every continuation tab (D5 is the TL of D5:E5).
         ws.cell(row=NAME_ROW, column=NAME_COL, value=employee_name)
 
-        # Write receipt rows. We explicitly write column A (sequential #) because
-        # the template's pre-filled numbers display with a broken number format
-        # on some Excel versions (showing "0000000000" for mid-range rows).
-        # Use plain integers with "General" format to guarantee a clean render.
+        # Write receipt rows. Column A (sequential #) is written explicitly
+        # because the template's pre-filled numbers display with a broken
+        # number format on some Excel versions.
         sheet_total = 0.0
         for i, r in enumerate(chunk):
             row = DATA_START_ROW + i
@@ -95,21 +95,20 @@ async def build_xlsx(telegram_id: int, employee_name: str, output_path: Path) ->
             ws.cell(row=row, column=5, value=vat)
             sheet_total += vat
 
-        # Blank out any leftover rows in this sheet's data block so old
-        # template numbers (1-30) don't leak through when the chunk is short.
+        # Blank leftover rows in this sheet's data block so stale template
+        # numbers (1-30) don't show through when the chunk is short/empty.
         for i in range(len(chunk), ROWS_PER_SHEET):
             row = DATA_START_ROW + i
             for col in range(1, 6):
-                cell = ws.cell(row=row, column=col)
-                cell.value = None
+                ws.cell(row=row, column=col).value = None
 
-        # Write per-sheet total as a value (E40), replacing the formula
-        ws.cell(row=PER_SHEET_TOTAL_ROW, column=PER_SHEET_TOTAL_COL, value=sheet_total)
-        grand_total += sheet_total
+        # Running total through this sheet (E40), replacing the SUM formula.
+        cumulative_total += sheet_total
+        ws.cell(row=PER_SHEET_TOTAL_ROW, column=PER_SHEET_TOTAL_COL, value=cumulative_total)
 
-    # Write grand total as a value to D6 in Table sheet (D6:E6 merged cell)
+    # Grand total on Table!D6 (D6:E6 merged cell).
     if "Table" in wb.sheetnames:
-        wb["Table"].cell(row=GRAND_TOTAL_ROW, column=GRAND_TOTAL_COL, value=grand_total)
+        wb["Table"].cell(row=GRAND_TOTAL_ROW, column=GRAND_TOTAL_COL, value=cumulative_total)
 
     wb.save(output_path)
     return output_path
