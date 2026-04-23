@@ -1,4 +1,4 @@
-# VAT Refund Telegram Bot
+# Tashkent Embassy VAT Refund V1
 
 A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts and file VAT refund requests automatically.
 

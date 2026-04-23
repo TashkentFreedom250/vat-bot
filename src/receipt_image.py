@@ -218,7 +218,9 @@ def _decode_with_opencv(img: np.ndarray) -> list[str]:
     return results
 
 
-def _decode_with_zxing(img: np.ndarray) -> list[str]:
+def _decode_with_zxing(
+    img: np.ndarray, *, allow_internal_downscale: bool = False
+) -> list[str]:
     results: list[str] = []
     for binarizer in (
         zxingcpp.Binarizer.LocalAverage,
@@ -229,9 +231,10 @@ def _decode_with_zxing(img: np.ndarray) -> list[str]:
                 img,
                 formats=zxingcpp.BarcodeFormat.QRCode,
                 try_rotate=True,
-                # try_downscale lets zxing search multiple internal scales —
-                # this recovers QRs that are small-in-frame on good photos.
-                try_downscale=True,
+                # Internal downscaling helps when the QR is tiny in-frame, but
+                # it can be less reliable on already-good full receipt photos.
+                # Keep it for the rescue pass instead of every decode attempt.
+                try_downscale=allow_internal_downscale,
                 try_invert=True,
                 binarizer=binarizer,
             )
@@ -241,11 +244,16 @@ def _decode_with_zxing(img: np.ndarray) -> list[str]:
     return results
 
 
-def _decode_image(img: np.ndarray) -> list[str]:
+def _decode_image(
+    img: np.ndarray, *, zxing_allow_downscale: bool = False
+) -> list[str]:
     """Try several QR decoders and return unique payloads."""
     results = []
     _append_unique(results, _decode_with_opencv(img))
-    _append_unique(results, _decode_with_zxing(img))
+    _append_unique(
+        results,
+        _decode_with_zxing(img, allow_internal_downscale=zxing_allow_downscale),
+    )
     return results
 
 
@@ -256,6 +264,7 @@ def _candidate_regions(img: np.ndarray, aggressive: bool) -> list[np.ndarray]:
         [
             img[int(h * 0.45):, :],
             img[int(h * 0.60):, :],
+            img[int(h * 0.45):, int(w * 0.15):int(w * 0.85)],
             img[h // 2:, :w // 2],
             img[h // 2:, w // 2:],
         ]
@@ -263,6 +272,7 @@ def _candidate_regions(img: np.ndarray, aggressive: bool) -> list[np.ndarray]:
         else [
             img[int(h * 0.60):, :],
             img[int(h * 0.70):, :],
+            img[int(h * 0.55):, int(w * 0.2):int(w * 0.8)],
             img[int(h * 0.35):, int(w * 0.1):int(w * 0.9)],
         ]
     )
@@ -297,6 +307,13 @@ def _variant_groups(
             clahe,
             _with_border(clahe),
         ]
+        if max(region.shape[:2]) < 1600:
+            variants.extend(
+                [
+                    _with_border(_resize_variant(region, 2, cv2.INTER_CUBIC)),
+                    _with_border(_resize_variant(gray, 2, cv2.INTER_CUBIC)),
+                ]
+            )
         if low_quality:
             variants.extend(
                 [
@@ -336,6 +353,10 @@ def _soliq_payload(found: list[str]) -> Optional[str]:
     return None
 
 
+def _decode_stages(aggressive: bool) -> list[bool]:
+    return [False, True] if aggressive else [False]
+
+
 def _rotations(img: np.ndarray) -> list[np.ndarray]:
     """The four cardinal rotations of an image — phone shots come in at any angle."""
     return [
@@ -355,20 +376,21 @@ def extract_qr_url(image_bytes: bytes) -> Optional[str]:
     so the caller can tell the user no fiscal QR was detected.
     """
     native = _to_cv(image_bytes)
-    # Fast path: higher-than-default resolution. High-res phone photos
-    # often only resolve at closer to their original pixel density.
+    # Fast path: high-res phone photos often decode best near-native before
+    # heavier preprocessing or internal ZXing downscaling kicks in.
     found: list[str] = []
     hires = _downscale_for_decode(native, max_dim=2500)
-    _append_unique(found, _decode_with_zxing(hires))
-    soliq = _soliq_payload(found)
-    if soliq:
-        return soliq
+    for region in _candidate_regions(hires, aggressive=False)[:3]:
+        _append_unique(found, _decode_image(region))
+        soliq = _soliq_payload(found)
+        if soliq:
+            return soliq
 
     img = _downscale_for_decode(native)
     aggressive = len(image_bytes) < 250_000 or min(img.shape[:2]) < 1000
     low_quality = aggressive
 
-    for stage in (False, aggressive):
+    for stage in _decode_stages(aggressive):
         for region in _candidate_regions(img, aggressive=stage):
             for variant in _variant_groups(
                 region, aggressive=stage, low_quality=low_quality
@@ -378,11 +400,22 @@ def extract_qr_url(image_bytes: bytes) -> Optional[str]:
                 if soliq:
                     return soliq
 
+    # Rescue pass: let ZXing search internal downscaled levels, but only on
+    # the most likely QR-heavy crops so we do not overprocess every image.
+    for region in _candidate_regions(hires, aggressive=True)[1:]:
+        _append_unique(
+            found,
+            _decode_with_zxing(region, allow_internal_downscale=True),
+        )
+        soliq = _soliq_payload(found)
+        if soliq:
+            return soliq
+
     # Last-ditch: rotate the full image 90/180/270° and retry. Phones mount
     # receipts at any angle; most decoders try rotation internally but miss
     # edge cases on extreme portrait shots.
     for rotated in _rotations(img)[1:]:
-        _append_unique(found, _decode_with_zxing(rotated))
+        _append_unique(found, _decode_image(rotated, zxing_allow_downscale=True))
         soliq = _soliq_payload(found)
         if soliq:
             return soliq

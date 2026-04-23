@@ -14,6 +14,7 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+from html import escape
 import logging
 import os
 import uuid
@@ -202,8 +203,10 @@ async def _save_verified_receipt(
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     await db.upsert_user(user.id, user.full_name or user.username or str(user.id))
+    first_name = escape(user.first_name or "there")
     await update.message.reply_text(
-        f"Hi {user.first_name}! I'm your VAT Refund bot.\n\n"
+        f"<b>Tashkent Embassy VAT Refund V1</b>\n"
+        f"Hi {first_name}! Your embassy receipt assistant is ready.\n\n"
         "Send receipts as files (not photos) for best QR results:\n"
         "  Tap paperclip -> File -> choose image\n\n"
         "I will auto-crop, read the QR, fetch VAT from soliq.uz, and store it.\n\n"
@@ -215,7 +218,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "/cancel_pending - discard a receipt waiting for a QR close-up\n"
         "/reset - delete everything\n"
         "/help - show this message\n\n"
-        f"Need help? Contact {config.SUPPORT_CONTACT}."
+        f"Need help? Contact {config.SUPPORT_CONTACT}.",
+        parse_mode="HTML",
     )
 
 

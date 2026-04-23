@@ -275,7 +275,7 @@ async def _write_pdf_chunk(
     margin = 15 * mm
 
     # --- Cover / summary page ---
-    title = "VAT Refund – Receipt Package"
+    title = "Tashkent Embassy VAT Refund V1 - Receipt Package"
     if total_parts > 1:
         title += f"  (Part {part_idx} of {total_parts})"
     c.setFont("Helvetica-Bold", 16)
