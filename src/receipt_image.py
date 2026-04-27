@@ -377,11 +377,29 @@ def extract_qr_url(image_bytes: bytes) -> Optional[str]:
     """
     native = _to_cv(image_bytes)
     # Fast path: high-res phone photos often decode best near-native before
-    # heavier preprocessing or internal ZXing downscaling kicks in.
+    # heavier preprocessing or internal ZXing downscaling kicks in. We try
+    # three cheap variants up front — raw, LAB-normalized (handles shadows),
+    # and a bordered copy (helps decoders that fail when a QR sits near a
+    # receipt edge). These three alone catch the vast majority of good shots.
     found: list[str] = []
     hires = _downscale_for_decode(native, max_dim=2500)
+    hires_lab = _lab_normalized(hires)
+    hires_bordered = _with_border(hires, size=40)
+    for variant in (hires, hires_lab, hires_bordered):
+        _append_unique(found, _decode_image(variant))
+        soliq = _soliq_payload(found)
+        if soliq:
+            return soliq
+
     for region in _candidate_regions(hires, aggressive=False)[:3]:
         _append_unique(found, _decode_image(region))
+        soliq = _soliq_payload(found)
+        if soliq:
+            return soliq
+
+        # One quick LAB pass per region — shadow-heavy photos often decode
+        # here when a raw pass couldn't lock onto the finder patterns.
+        _append_unique(found, _decode_image(_lab_normalized(region)))
         soliq = _soliq_payload(found)
         if soliq:
             return soliq

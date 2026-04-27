@@ -13,12 +13,38 @@ Collections:
         telegram_id, image_file_id (GridFS), created_at, expires_at
     }
 """
+import asyncio
 from datetime import datetime, timedelta
+from io import BytesIO
 from typing import Optional
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
+from PIL import Image
+from pillow_heif import register_heif_opener
 
 from . import config
+
+register_heif_opener()
+
+# JPEG quality used when storing receipt images in GridFS. 85 is visually
+# indistinguishable from the original for receipt photos and drops storage
+# by ~5-10× vs PNG — the difference between 30 users and 500+ users on a
+# 100 GB disk budget.
+_STORAGE_JPEG_QUALITY = 85
+
+
+def _to_jpeg_bytes(image_bytes: bytes) -> bytes:
+    """Re-encode any input image (HEIC/PNG/JPEG/etc.) to JPEG for storage.
+
+    QR decoding and vendor OCR have already run by the time we call this, so
+    the small quality loss is harmless for long-term storage.
+    """
+    pil = Image.open(BytesIO(image_bytes))
+    if pil.mode != "RGB":
+        pil = pil.convert("RGB")
+    buf = BytesIO()
+    pil.save(buf, format="JPEG", quality=_STORAGE_JPEG_QUALITY, optimize=True)
+    return buf.getvalue()
 
 _client: Optional[AsyncIOMotorClient] = None
 _db = None
@@ -64,12 +90,18 @@ async def ping() -> None:
 
 
 async def upsert_user(telegram_id: int, name: str) -> None:
+    """Create a user record on first contact, but never overwrite the name
+    the user set themselves via /setname. `name` here is the Telegram
+    display name — only useful as a default; exports rely on the name the
+    user explicitly chose."""
     db = get_db()
     await db.users.update_one(
         {"telegram_id": telegram_id},
         {
-            "$set": {"name": name},
-            "$setOnInsert": {"created_at": datetime.utcnow()},
+            "$setOnInsert": {
+                "name": name,
+                "created_at": datetime.utcnow(),
+            },
         },
         upsert=True,
     )
@@ -90,12 +122,24 @@ async def set_user_name(telegram_id: int, name: str) -> None:
 
 
 async def save_image(telegram_id: int, image_bytes: bytes, filename: str) -> str:
-    """Save PNG bytes to GridFS and return the file id as str."""
+    """Re-encode to JPEG and save to GridFS. Returns the file id as str.
+
+    Accepts any image format the bot receives (iPhone HEIC, Telegram JPEG,
+    OpenCV PNG). Storing as JPEG keeps the on-disk footprint small so the
+    Mac SSD can host many users.
+    """
+    loop = asyncio.get_running_loop()
+    jpeg_bytes = await loop.run_in_executor(None, _to_jpeg_bytes, image_bytes)
+
+    if not filename.lower().endswith((".jpg", ".jpeg")):
+        root = filename.rsplit(".", 1)[0] if "." in filename else filename
+        filename = f"{root}.jpg"
+
     fs = get_fs()
     file_id = await fs.upload_from_stream(
         filename,
-        image_bytes,
-        metadata={"telegram_id": telegram_id, "content_type": "image/png"},
+        jpeg_bytes,
+        metadata={"telegram_id": telegram_id, "content_type": "image/jpeg"},
     )
     return str(file_id)
 
@@ -136,6 +180,15 @@ async def delete_pending_receipt(telegram_id: int) -> int:
             await fs.delete(ObjectId(pending["image_file_id"]))
         except Exception:
             pass
+    result = await db.pending_receipts.delete_one({"telegram_id": telegram_id})
+    return result.deleted_count
+
+
+async def detach_pending_receipt(telegram_id: int) -> int:
+    """Remove the pending_receipts row but KEEP the GridFS image — the caller
+    has just transferred ownership of the image to a saved receipt (e.g. a
+    /manual entry that adopts the photo from a failed QR scan)."""
+    db = get_db()
     result = await db.pending_receipts.delete_one({"telegram_id": telegram_id})
     return result.deleted_count
 

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vatbot.bot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/tashkent/Tashkent/vat-bot/run_bot.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/tashkent/Tashkent/vat-bot</string>
+
+    <!-- Auto-start when the Mac boots / user logs in -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart automatically if the bot crashes or exits -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Don't hammer the network if something's fundamentally broken -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Crash-only capture for import errors or uncaught exceptions that
+         fire before Python logging is configured. Normal log output goes
+         to logs/bot.log which the bot rotates itself daily. -->
+    <key>StandardOutPath</key>
+    <string>/Users/tashkent/Tashkent/vat-bot/logs/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/tashkent/Tashkent/vat-bot/logs/launchd.err.log</string>
+
+    <!-- Give Homebrew tools (mongosh, mongodump, python 3.11) their usual
+         PATH, and set VAT_BOT_LAUNCHD=1 so run_bot.sh knows it's being
+         invoked by launchd (and should just run the bot, not re-install). -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>VAT_BOT_LAUNCHD</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>

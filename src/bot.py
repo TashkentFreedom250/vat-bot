@@ -14,14 +14,17 @@ Commands:
 from __future__ import annotations
 
 import asyncio
+from datetime import time as dt_time
 from html import escape
 import logging
+import logging.handlers
 import os
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -31,14 +34,43 @@ from telegram.ext import (
     filters,
 )
 
-from . import config, db, exporter, receipt_image, receipt_ocr, soliq
+from . import config, db, exporter, maintenance, receipt_image, receipt_ocr, soliq
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+def _configure_logging() -> None:
+    """Log to a rotating daily file the bot manages itself.
+
+    When running under launchd (VAT_BOT_LAUNCHD=1) we skip the console
+    handler — stdout/stderr go to launchd's crash-only capture file, and
+    everything normal lives in logs/bot.log which rotates itself nightly.
+    """
+    log_dir = config.BASE_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers.clear()
+
+    if not os.environ.get("VAT_BOT_LAUNCHD"):
+        console = logging.StreamHandler()
+        console.setFormatter(fmt)
+        root.addHandler(console)
+
+    file_handler = logging.handlers.TimedRotatingFileHandler(
+        log_dir / "bot.log",
+        when="midnight",
+        backupCount=14,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(fmt)
+    root.addHandler(file_handler)
+
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+_configure_logging()
 logger = logging.getLogger("vat_bot")
 SAVE_DEBUG_IMAGES = os.getenv("SAVE_DEBUG_IMAGES", "").lower() in {"1", "true", "yes"}
 
@@ -67,15 +99,14 @@ def _qr_failure_message(*, retry: bool) -> str:
     )
     return (
         f"{lead}\n\n"
-        "Easiest fix — let your phone's camera do the reading:\n"
-        "  1. Open your phone's camera app (no need to take a photo)\n"
-        "  2. Point it at the QR code on the receipt\n"
-        "  3. Your phone shows a yellow/white banner with the link\n"
-        "  4. Long-press the banner → Share → pick this chat\n"
-        "  5. I'll pull the data automatically\n\n"
-        "Or:\n"
-        "• Send a clearer close-up photo of just the QR code\n"
-        "• /cancel_pending to discard this receipt\n\n"
+        "You have three options:\n\n"
+        "1) Send a clearer close-up photo of just the QR code.\n\n"
+        "2) Paste the soliq.uz link — open your phone's camera, point it at "
+        "the QR, long-press the yellow banner → Share → pick this chat.\n\n"
+        "3) /manual — type the receipt in by hand (date, vendor, receipt #, "
+        "VAT). The photo you just sent will stay attached. Use "
+        "/cancel_manual at any time to abort.\n\n"
+        "Or /cancel_pending to discard this receipt entirely.\n\n"
         f"Need help? Contact {config.SUPPORT_CONTACT}."
     )
 
@@ -205,20 +236,21 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await db.upsert_user(user.id, user.full_name or user.username or str(user.id))
     first_name = escape(user.first_name or "there")
     await update.message.reply_text(
-        f"<b>Tashkent Embassy VAT Refund V1</b>\n"
-        f"Hi {first_name}! Your embassy receipt assistant is ready.\n\n"
-        "Send receipts as files (not photos) for best QR results:\n"
-        "  Tap paperclip -> File -> choose image\n\n"
-        "I will auto-crop, read the QR, fetch VAT from soliq.uz, and store it.\n\n"
-        "Commands:\n"
-        "/setname &lt;your full name&gt; - used in exports\n"
-        "/list - show stored receipts\n"
-        "/export_vat - download filled VAT_Refund.xlsx\n"
-        "/export_pdf - download PDF with all receipts\n"
-        "/cancel_pending - discard a receipt waiting for a QR close-up\n"
-        "/reset - delete everything\n"
-        "/help - show this message\n\n"
-        f"Need help? Contact {config.SUPPORT_CONTACT}.",
+        f"<b>🇺🇸 Tashkent Embassy VAT Refund — V.5.0</b>\n"
+        f"Hi <b>{first_name}</b>! Send receipts as <b>files</b> (paperclip → File) "
+        f"for best QR results. I'll read the QR, fetch VAT from soliq.uz, and store it. "
+        f"If the QR is damaged or unreadable, use <b>/manual</b> to type the receipt in.\n\n"
+        "<b>Commands</b>\n"
+        "/setname — your name for exports\n"
+        "/manual — add a receipt manually (QR unreadable)\n"
+        "/list — show stored receipts\n"
+        "/export_vat — download VAT_Refund.xlsx\n"
+        "/export_pdf — download receipts PDF\n"
+        "/cancel_pending — discard a pending receipt\n"
+        "/cancel_manual — abort a manual entry\n"
+        "/reset — delete everything\n\n"
+        f"Need help? Contact <b>{escape(config.SUPPORT_CONTACT)}</b>.\n"
+        "⚖️ <i>MIT License — free to use, modify, and share.</i>",
         parse_mode="HTML",
     )
 
@@ -228,12 +260,19 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_setname(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not ctx.args:
-        await update.message.reply_text("Usage: /setname John Smith")
+    if ctx.args:
+        name = " ".join(ctx.args).strip()
+        await db.set_user_name(update.effective_user.id, name)
+        ctx.user_data.pop("awaiting_name", None)
+        await update.message.reply_text(f"Name set to: {name}")
         return
-    name = " ".join(ctx.args).strip()
-    await db.set_user_name(update.effective_user.id, name)
-    await update.message.reply_text(f"Name set to: {name}")
+    # No name typed after the command — ask for it, and the next plain-text
+    # message the user sends becomes their name (see handle_text).
+    ctx.user_data["awaiting_name"] = True
+    await update.message.reply_text(
+        "Please type your full name (as it should appear in exports).\n\n"
+        "Example: John Smith"
+    )
 
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -247,72 +286,151 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     for i, r in enumerate(receipts, 1):
         vat = float(r.get("vat_amount") or 0)
         total_vat += vat
+        marker = " [manual]" if r.get("manual") else ""
         lines.append(
             f"{i}. {r.get('date', '?')} - {_display_vendor(r)[:25] or '?'} - "
-            f"VAT: {vat:,.2f} UZS"
+            f"VAT: {vat:,.2f} UZS{marker}"
         )
     lines.append(f"\nTotal VAT: {total_vat:,.2f} UZS")
-    await update.message.reply_text("\n".join(lines))
+
+    # Telegram rejects messages over 4096 chars (BadRequest: Message is too long).
+    # Pack lines into chunks safely under that cap.
+    MAX_CHARS = 3500
+    buf: list[str] = []
+    buf_len = 0
+    for line in lines:
+        if buf and buf_len + len(line) + 1 > MAX_CHARS:
+            await update.message.reply_text("\n".join(buf))
+            buf = []
+            buf_len = 0
+        buf.append(line)
+        buf_len += len(line) + 1
+    if buf:
+        await update.message.reply_text("\n".join(buf))
+
+
+def _receipt_year(r: dict) -> str:
+    """Extract the calendar year from a receipt's date for grouping. Receipts
+    from soliq.uz and the /manual flow both store dates as YYYY-MM-DD; anything
+    else (or missing) goes into an 'undated' bucket so nothing is lost."""
+    date = (r.get("date") or "").strip()
+    if len(date) >= 4 and date[:4].isdigit():
+        return date[:4]
+    return "undated"
+
+
+def _group_by_year(receipts: list[dict]) -> dict[str, list[dict]]:
+    groups: dict[str, list[dict]] = {}
+    for r in receipts:
+        groups.setdefault(_receipt_year(r), []).append(r)
+    return groups
+
+
+def _sorted_year_keys(groups: dict[str, list[dict]]) -> list[str]:
+    """Numeric years ascending, then 'undated' last."""
+    years = [k for k in groups if k != "undated"]
+    years.sort()
+    if "undated" in groups:
+        years.append("undated")
+    return years
 
 
 async def cmd_export_vat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    count = await db.count_receipts(uid)
-    if count == 0:
+    receipts = await db.list_receipts(uid)
+    if not receipts:
         await update.message.reply_text("No receipts to export yet.")
         return
-    if count > 120:
-        await update.message.reply_text(
-            "You have more than 120 receipts. The template only fits 120. "
-            "Only the first 120 will be included."
-        )
 
-    await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
+    groups = _group_by_year(receipts)
+    years = _sorted_year_keys(groups)
     user = await db.get_user(uid)
     name = (user or {}).get("name", "")
 
-    out_path = config.TMP_DIR / f"VAT_Refund_{uid}_{uuid.uuid4().hex[:6]}.xlsx"
-    await exporter.build_xlsx(uid, name, out_path)
-
-    with open(out_path, "rb") as f:
-        await update.message.reply_document(
-            document=f,
-            filename="VAT_Refund.xlsx",
-            caption=f"Filled with {count} receipt(s).",
+    if len(years) > 1:
+        await update.message.reply_text(
+            f"You have receipts across {len(years)} calendar years: {', '.join(years)}.\n"
+            "The tax office wants one VAT file per year, so I'll send one Excel for each."
         )
-    out_path.unlink(missing_ok=True)
+
+    await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
+
+    for year in years:
+        year_receipts = groups[year]
+        if len(year_receipts) > 120:
+            await update.message.reply_text(
+                f"You have {len(year_receipts)} receipts for {year}, but the template "
+                "only fits 120. Only the first 120 will be included for that year."
+            )
+            year_receipts = year_receipts[:120]
+
+        out_path = config.TMP_DIR / f"VAT_Refund_{year}_{uid}_{uuid.uuid4().hex[:6]}.xlsx"
+        exporter.build_xlsx_from_receipts(year_receipts, name, out_path)
+
+        total_vat = sum(float(r.get("vat_amount") or 0) for r in year_receipts)
+        caption = (
+            f"VAT for {year} — {len(year_receipts)} receipt(s) — "
+            f"Total: {total_vat:,.2f} UZS"
+        )
+        with open(out_path, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=f"VAT_Refund_{year}.xlsx",
+                caption=caption,
+            )
+        out_path.unlink(missing_ok=True)
 
 
 async def cmd_export_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    count = await db.count_receipts(uid)
-    if count == 0:
+    receipts = await db.list_receipts(uid)
+    if not receipts:
         await update.message.reply_text("No receipts to export yet.")
         return
 
-    await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
+    groups = _group_by_year(receipts)
+    years = _sorted_year_keys(groups)
     user = await db.get_user(uid)
     name = (user or {}).get("name", "")
 
-    prefix = f"Receipts_{uid}_{uuid.uuid4().hex[:6]}"
-    paths = await exporter.build_pdfs(uid, name, config.TMP_DIR, name_prefix=prefix)
-    total_parts = len(paths)
+    if len(years) > 1:
+        await update.message.reply_text(
+            f"You have receipts across {len(years)} calendar years: {', '.join(years)}.\n"
+            "Sending one receipt-package PDF per year."
+        )
 
-    try:
-        for idx, path in enumerate(paths, 1):
-            if total_parts > 1:
-                filename = f"Receipts_part{idx}_of_{total_parts}.pdf"
-                caption = f"Part {idx} of {total_parts} ({count} receipts total)"
-            else:
-                filename = "Receipts.pdf"
-                caption = f"{count} receipt(s) packaged."
-            with open(path, "rb") as f:
-                await update.message.reply_document(
-                    document=f, filename=filename, caption=caption,
-                )
-    finally:
-        for path in paths:
-            path.unlink(missing_ok=True)
+    await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
+
+    for year in years:
+        year_receipts = groups[year]
+        prefix = f"Receipts_{year}_{uid}_{uuid.uuid4().hex[:6]}"
+        paths = await exporter.build_pdfs_from_receipts(
+            year_receipts, name, config.TMP_DIR, name_prefix=prefix
+        )
+        total_parts = len(paths)
+        total_vat = sum(float(r.get("vat_amount") or 0) for r in year_receipts)
+
+        try:
+            for idx, path in enumerate(paths, 1):
+                if total_parts > 1:
+                    filename = f"Receipts_{year}_part{idx}_of_{total_parts}.pdf"
+                    caption = (
+                        f"Receipts for {year} — part {idx} of {total_parts} "
+                        f"({len(year_receipts)} receipt(s), total {total_vat:,.2f} UZS)"
+                    )
+                else:
+                    filename = f"Receipts_{year}.pdf"
+                    caption = (
+                        f"Receipts for {year} — {len(year_receipts)} receipt(s) — "
+                        f"Total: {total_vat:,.2f} UZS"
+                    )
+                with open(path, "rb") as f:
+                    await update.message.reply_document(
+                        document=f, filename=filename, caption=caption,
+                    )
+        finally:
+            for path in paths:
+                path.unlink(missing_ok=True)
 
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -327,6 +445,188 @@ async def cmd_cancel_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Pending receipt discarded. You can send a new receipt now.")
         return
     await update.message.reply_text("There is no pending QR retry right now.")
+
+
+# ---------- Manual entry (when QR is unreadable) ----------
+
+_MANUAL_DATE_FORMATS = ["%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%m/%d/%Y", "%Y/%m/%d"]
+
+
+def _parse_manual_date(s: str) -> str | None:
+    from datetime import datetime as _dt
+    s = s.strip()
+    for fmt in _MANUAL_DATE_FORMATS:
+        try:
+            return _dt.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_manual_vat(s: str) -> float | None:
+    """Parse a VAT number written in any of the formats users actually type:
+    36173.14 / 36,173.14 / 36 173,14 / 36173. Reject zero or negative."""
+    cleaned = s.strip().replace(" ", "").replace("\u00A0", "")
+    if "," in cleaned and "." in cleaned:
+        # Whichever separator is rightmost is the decimal one.
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        last = cleaned.rfind(",")
+        if len(cleaned) - last - 1 in (1, 2):
+            cleaned = cleaned.replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    try:
+        v = float(cleaned)
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
+async def cmd_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start a 4-step manual-entry conversation for receipts whose QR is unreadable."""
+    uid = update.effective_user.id
+    await db.upsert_user(uid, update.effective_user.full_name or "")
+    ctx.user_data.pop("awaiting_name", None)
+
+    # If the user got here from a QR failure, there's a pending receipt
+    # already in the DB with the full photo. Attach that image to whatever
+    # they type in, so the manual receipt still appears in the PDF export.
+    pending = await db.get_pending_receipt(uid)
+    pending_image_id = pending.get("image_file_id") if pending else None
+
+    ctx.user_data["manual_step"] = "date"
+    ctx.user_data["manual_data"] = {
+        "pending_image_id": pending_image_id,
+    }
+
+    intro = (
+        "Manual entry — Step 1 of 4\n\n"
+        "I'll attach this to the photo you just sent.\n\n"
+        if pending_image_id
+        else "Manual entry — Step 1 of 4\n\n"
+    )
+    await update.message.reply_text(
+        f"{intro}"
+        "Date of the receipt? Format: YYYY-MM-DD (e.g. 2026-04-27).\n\n"
+        "Type /cancel_manual to abort."
+    )
+
+
+async def cmd_cancel_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if ctx.user_data.pop("manual_step", None) is not None:
+        ctx.user_data.pop("manual_data", None)
+        await update.message.reply_text("Manual entry cancelled.")
+        return
+    await update.message.reply_text("There is no manual entry in progress.")
+
+
+async def _handle_manual_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    step = ctx.user_data.get("manual_step")
+    data = ctx.user_data.setdefault("manual_data", {})
+
+    if step == "date":
+        normalized = _parse_manual_date(text)
+        if not normalized:
+            await update.message.reply_text(
+                "I couldn't read that date. Please use YYYY-MM-DD (e.g. 2026-04-27)."
+            )
+            return
+        data["date"] = normalized
+        ctx.user_data["manual_step"] = "vendor"
+        await update.message.reply_text(
+            "Step 2 of 4\n\nVendor name? (the shop or business on the receipt)."
+        )
+        return
+
+    if step == "vendor":
+        vendor = text.strip()[:200]
+        if not vendor:
+            await update.message.reply_text("Vendor name can't be empty. Try again.")
+            return
+        data["vendor"] = vendor
+        ctx.user_data["manual_step"] = "receipt_number"
+        await update.message.reply_text(
+            "Step 3 of 4\n\nReceipt number? (printed on the receipt)."
+        )
+        return
+
+    if step == "receipt_number":
+        rcpt = text.strip()[:80]
+        if not rcpt:
+            await update.message.reply_text("Receipt number can't be empty. Try again.")
+            return
+        data["receipt_number"] = rcpt
+        ctx.user_data["manual_step"] = "vat_amount"
+        await update.message.reply_text(
+            "Step 4 of 4\n\nVAT amount in UZS? (e.g. 36173.14)."
+        )
+        return
+
+    if step == "vat_amount":
+        vat = _parse_manual_vat(text)
+        if vat is None:
+            await update.message.reply_text(
+                "I couldn't read that as a number. Try again, e.g. 36173.14"
+            )
+            return
+        data["vat_amount"] = vat
+        uid = update.effective_user.id
+        # If /manual was started after a failed QR scan, re-use that pending
+        # photo so the manual receipt still has an image in the PDF export.
+        # Re-check the DB at save time (instead of trusting the snapshot we
+        # took at /manual): the user could have run /cancel_pending mid-flow.
+        pending_now = await db.get_pending_receipt(uid)
+        attached_image_id = pending_now.get("image_file_id") if pending_now else None
+
+        receipt_doc = {
+            "telegram_id": uid,
+            "image_file_id": attached_image_id,
+            "qr_image_file_id": None,
+            "date": data["date"],
+            "vendor": data["vendor"],
+            "printed_vendor": "",
+            "display_vendor": data["vendor"],
+            "receipt_number": data["receipt_number"],
+            "vat_amount": data["vat_amount"],
+            "total_amount": 0.0,
+            "soliq_url": "",
+            "raw_qr": "",
+            "manual": True,
+        }
+        inserted = await db.save_receipt(receipt_doc)
+        ctx.user_data.pop("manual_step", None)
+        ctx.user_data.pop("manual_data", None)
+        if inserted is None:
+            await update.message.reply_text(
+                f"A receipt with number {data['receipt_number']} is already in your records — nothing saved."
+            )
+            return
+
+        # The pending row pointed at this image; we now own the image as
+        # part of the saved receipt. Detach the pending row WITHOUT deleting
+        # the GridFS file, otherwise the manual entry would lose its photo.
+        if pending_now:
+            await db.detach_pending_receipt(uid)
+
+        count = await db.count_receipts(uid)
+        attach_note = (
+            "\nThe photo you sent earlier is attached to this entry."
+            if attached_image_id else ""
+        )
+        await update.message.reply_text(
+            f"Manual receipt added (#{count}) — flagged for finance review.\n\n"
+            f"Date: {data['date']}\n"
+            f"Vendor: {data['vendor']}\n"
+            f"Receipt #: {data['receipt_number']}\n"
+            f"VAT: {data['vat_amount']:,.2f} UZS"
+            f"{attach_note}\n\n"
+            "The row number is shown in BOLD in the VAT_Refund.xlsx so the finance "
+            "office can review manual entries."
+        )
 
 
 # ---------- Photo handler ----------
@@ -480,9 +780,33 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Accept a pasted soliq.uz URL to complete a pending receipt."""
+    """Accept a pasted soliq.uz URL to complete a pending receipt, OR a name
+    typed in response to /setname without arguments."""
     uid = update.effective_user.id
     text = (update.message.text or "").strip()
+
+    # Manual-entry conversation has highest priority — when the user is
+    # mid-flow, every plain-text message answers the next question.
+    if ctx.user_data.get("manual_step"):
+        await _handle_manual_step(update, ctx, text)
+        return
+
+    # If the user clicked /setname (no args), their next plain-text message
+    # is treated as their name. Guard against accidents: pasted URLs or
+    # empty text don't make sense as names.
+    if ctx.user_data.get("awaiting_name"):
+        ctx.user_data.pop("awaiting_name", None)
+        if not text or "soliq.uz" in text.lower() or text.startswith("/"):
+            await update.message.reply_text(
+                "That didn't look like a name — nothing saved. "
+                "Tap /setname again to try once more."
+            )
+            return
+        # Keep names short so bogus pastes don't turn into 4 KB vendor names
+        name = text[:120].strip()
+        await db.set_user_name(uid, name)
+        await update.message.reply_text(f"Thanks — saved your name as: {name}")
+        return
 
     pending = await db.get_pending_receipt(uid)
     if not pending:
@@ -534,10 +858,49 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ---------- App setup ----------
 
+_BOT_COMMANDS = [
+    BotCommand("start", "Welcome + show help"),
+    BotCommand("setname", "Set your name for exports"),
+    BotCommand("manual", "Add a receipt manually (when QR is unreadable)"),
+    BotCommand("list", "Show stored receipts"),
+    BotCommand("export_vat", "Download VAT_Refund.xlsx"),
+    BotCommand("export_pdf", "Download PDF of all receipts"),
+    BotCommand("cancel_pending", "Discard a receipt waiting for a QR close-up"),
+    BotCommand("cancel_manual", "Abort a manual entry in progress"),
+    BotCommand("reset", "Delete everything"),
+    BotCommand("help", "Show help"),
+]
+
+
 async def _post_init(app: Application) -> None:
     asyncio.get_running_loop().set_default_executor(_executor)
-    me = await app.bot.get_me()
-    logger.info("Connected to Telegram as @%s", me.username)
+
+    # Retry the initial Telegram handshake — WiFi can drop for a few seconds
+    # right as the bot starts and a single ConnectError should not kill us.
+    for attempt in range(1, 6):
+        try:
+            me = await app.bot.get_me()
+            logger.info("Connected to Telegram as @%s", me.username)
+            break
+        except Exception:
+            logger.warning(
+                "Telegram get_me failed (attempt %s/5) — retrying in 5s.",
+                attempt,
+                exc_info=True,
+            )
+            if attempt == 5:
+                raise
+            await asyncio.sleep(5)
+
+    # Overwrite Telegram's command menu with exactly the commands we handle.
+    # Without this, the "/" menu in Telegram keeps showing stale commands
+    # that BotFather picked up from older iterations of this bot.
+    try:
+        await app.bot.set_my_commands(_BOT_COMMANDS)
+        logger.info("Telegram command menu set to %d commands.", len(_BOT_COMMANDS))
+    except Exception:
+        logger.warning("Could not update bot command menu", exc_info=True)
+
     logger.info(
         "MongoDB target: host=%s db=%s uri=%s",
         config.mongodb_host_hint(),
@@ -553,21 +916,52 @@ async def _post_init(app: Application) -> None:
             if deleted:
                 logger.info("Deleted %s orphaned GridFS image(s).", deleted)
             logger.info("MongoDB reachable and indexes ensured.")
-            return
+            break
         except Exception:
             logger.exception("MongoDB startup check failed (attempt %s/3)", attempt)
             if attempt == 3:
                 raise
             await asyncio.sleep(3)
 
+    # Schedule the bot to manage its own backups, log rotation (already
+    # wired into logging), and disk-usage warnings. The bot catches up
+    # immediately if we missed a nightly window (Mac was asleep, bot
+    # crashed, etc.) then schedules 03:30 runs every night afterward.
+    if app.job_queue is not None:
+        app.job_queue.run_once(
+            maintenance.run_startup_catchup,
+            when=30,
+            name="maintenance_catchup",
+        )
+        app.job_queue.run_daily(
+            maintenance.run_nightly,
+            time=dt_time(hour=3, minute=30),
+            name="maintenance_nightly",
+        )
+        logger.info("Self-managed maintenance scheduled (nightly 03:30 + startup catch-up).")
+    else:
+        logger.warning(
+            "JobQueue unavailable — install python-telegram-bot[job-queue] "
+            "to enable self-managed backups."
+        )
 
-def main() -> None:
-    logger.info("Starting VAT bot (local Mac host).")
+
+def _build_app() -> Application:
     app = (
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
         .post_init(_post_init)
         .concurrent_updates(True)
+        # Generous long-poll timeouts — WiFi jitters on cafe/hotel networks
+        # caused httpx.ConnectError bursts during get_updates.
+        .get_updates_connect_timeout(30.0)
+        .get_updates_read_timeout(40.0)
+        .get_updates_write_timeout(30.0)
+        .get_updates_pool_timeout(30.0)
+        .connect_timeout(30.0)
+        .read_timeout(40.0)
+        .write_timeout(40.0)
+        .pool_timeout(30.0)
         .build()
     )
 
@@ -576,6 +970,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("setname", cmd_setname))
+    app.add_handler(CommandHandler("manual", cmd_manual))
+    app.add_handler(CommandHandler("cancel_manual", cmd_cancel_manual))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("export_vat", cmd_export_vat))
     app.add_handler(CommandHandler("export_pdf", cmd_export_pdf))
@@ -585,13 +981,29 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    return app
 
-    logger.info("Bot starting...")
-    try:
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
-    except Exception:
-        logger.exception("Bot crashed during startup or polling.")
-        raise
+
+def main() -> None:
+    logger.info("Starting VAT bot (local Mac host).")
+    # Auto-restart loop: if WiFi drops long enough to break polling, rebuild
+    # the Application and resume. Exponential backoff caps at 60s so we don't
+    # hammer the network while it's down.
+    backoff = 5
+    while True:
+        app = _build_app()
+        logger.info("Bot polling...")
+        try:
+            app.run_polling(allowed_updates=Update.ALL_TYPES)
+            logger.info("Polling exited cleanly. Shutting down.")
+            return
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Bot stopped by user.")
+            return
+        except Exception:
+            logger.exception("Polling crashed — restarting in %ss.", backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 
 if __name__ == "__main__":

@@ -161,18 +161,23 @@ def _get_engine():
     with _ENGINE_LOCK:
         if _ENGINE is not None:
             return _ENGINE
+        # RapidOCR emits "The text detection result is empty" at WARNING any
+        # time it scans a region without legible text — completely benign, but
+        # launchd captures it on stderr and the noise drowns out real errors.
+        # Pin the loggers (and the engine's own log_level) to ERROR so only
+        # actual problems leak out.
         try:
-            logging.getLogger("RapidOCR").setLevel(logging.WARNING)
-            logging.getLogger("rapidocr").setLevel(logging.WARNING)
+            logging.getLogger("RapidOCR").setLevel(logging.ERROR)
+            logging.getLogger("rapidocr").setLevel(logging.ERROR)
             from rapidocr import RapidOCR
         except Exception:
             logger.exception("RapidOCR is unavailable.")
             return None
 
         try:
-            _ENGINE = RapidOCR(params={"Global.log_level": "WARNING"})
-            logging.getLogger("RapidOCR").setLevel(logging.WARNING)
-            logging.getLogger("rapidocr").setLevel(logging.WARNING)
+            _ENGINE = RapidOCR(params={"Global.log_level": "ERROR"})
+            logging.getLogger("RapidOCR").setLevel(logging.ERROR)
+            logging.getLogger("rapidocr").setLevel(logging.ERROR)
         except Exception:
             logger.exception("Failed to initialize RapidOCR.")
             return None

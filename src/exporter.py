@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Iterable
 
 from openpyxl import load_workbook
+from openpyxl.styles import Font
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
@@ -57,13 +58,19 @@ def _find_name_cell(ws) -> tuple[int, int] | None:
 
 
 async def build_xlsx(telegram_id: int, employee_name: str, output_path: Path) -> Path:
-    """
-    Fill the VAT_Refund template with the user's receipts and save to output_path.
-    """
+    """Fill the VAT_Refund template with all of the user's receipts."""
+    receipts = await db.list_receipts(telegram_id)
+    return build_xlsx_from_receipts(receipts, employee_name, output_path)
+
+
+def build_xlsx_from_receipts(
+    receipts: list[dict], employee_name: str, output_path: Path
+) -> Path:
+    """Render a pre-filtered list of receipts into a fresh copy of the template.
+    Used by /export_vat to produce one workbook per calendar year."""
     shutil.copy(config.TEMPLATE_PATH, output_path)
     wb = load_workbook(output_path)
 
-    receipts = await db.list_receipts(telegram_id)
     cumulative_total = 0.0
 
     # Walk every sheet in the template — even empty ones get the employee
@@ -88,6 +95,16 @@ async def build_xlsx(telegram_id: int, employee_name: str, output_path: Path) ->
             seq = idx * ROWS_PER_SHEET + i + 1
             num_cell = ws.cell(row=row, column=1, value=seq)
             num_cell.number_format = "General"
+            # Manual entries: bold the row number so the finance office can
+            # spot rows that were typed in (and could contain typos) rather
+            # than fetched and verified from soliq.uz.
+            if r.get("manual"):
+                existing = num_cell.font
+                num_cell.font = Font(
+                    name=existing.name, size=existing.size,
+                    color=existing.color, family=existing.family,
+                    bold=True,
+                )
             ws.cell(row=row, column=2, value=r.get("date", ""))
             ws.cell(row=row, column=3, value=_display_vendor(r))
             ws.cell(row=row, column=4, value=r.get("receipt_number", ""))
@@ -229,6 +246,18 @@ async def build_pdfs(
 ) -> list[Path]:
     """Generate one or more PDFs (split every RECEIPTS_PER_PDF receipts)."""
     receipts = await db.list_receipts(telegram_id)
+    return await build_pdfs_from_receipts(
+        receipts, employee_name, output_dir, name_prefix
+    )
+
+
+async def build_pdfs_from_receipts(
+    receipts: list[dict],
+    employee_name: str,
+    output_dir: Path,
+    name_prefix: str = "Receipts",
+) -> list[Path]:
+    """PDF builder for a pre-filtered receipt set (e.g. one calendar year)."""
     if not receipts:
         return []
 
