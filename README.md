@@ -1,4 +1,4 @@
-# Tashkent Embassy VAT Refund V1
+# Tashkent Embassy VAT Refund Bot — V5
 
 A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts and file VAT refund requests automatically.
 
@@ -8,8 +8,9 @@ A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts an
 2. Bot **auto-crops** the receipt from the photo background
 3. Bot **decodes the QR code** on the receipt
 4. Bot fetches **verified VAT data from soliq.uz** (Uzbekistan tax authority) — not from OCR, so the amounts are always correct
-5. All receipts are stored per user in MongoDB (image + metadata)
-6. On command, bot generates the official **VAT_Refund.xlsx** already filled in, or a **PDF** with all receipt images
+5. If the QR is unreadable, the user can fall back to `/manual` and type the amounts in
+6. All receipts are stored per user in MongoDB (image + metadata)
+7. On command, bot generates the official **VAT_Refund.xlsx** already filled in (split by calendar year when receipts span multiple years), or a **PDF** with all receipt images
 
 ## Commands
 
@@ -18,11 +19,16 @@ A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts an
 | `/start` | Welcome + register |
 | `/setname John Smith` | Set employee name used in exports |
 | *(send photo)* | Add a receipt |
+| `/manual` | Add a receipt by hand when the QR can't be read |
+| `/cancel_manual` | Abort a manual entry in progress |
+| `/cancel_pending` | Discard a receipt waiting for a QR close-up |
 | `/list` | List all stored receipts |
-| `/export_vat` | Download filled `VAT_Refund.xlsx` |
+| `/export_vat` | Download filled `VAT_Refund.xlsx` (one file per year if needed) |
 | `/export_pdf` | Download PDF package (summary + images) |
 | `/reset` | Delete all receipts |
 | `/help` | Show help |
+
+A hidden `/heartcheck` command is available to admins listed in `ADMIN_TELEGRAM_IDS`. It returns a quick health snapshot (DB reachable, recent activity) and stays silent for everyone else.
 
 ## Running on Mac (recommended)
 
@@ -72,10 +78,17 @@ vat-bot/
 │   ├── config.py           # Env loading
 │   ├── db.py               # MongoDB + GridFS (async)
 │   ├── receipt_image.py    # Auto-crop + QR decode
+│   ├── receipt_ocr.py      # Optional OCR fallback (RapidOCR)
 │   ├── soliq.py            # Fetch verified VAT data from soliq.uz
-│   └── exporter.py         # XLSX + PDF export
+│   ├── exporter.py         # XLSX + PDF export (year-split aware)
+│   └── maintenance.py      # Nightly backup + disk/log housekeeping
 ├── templates/
 │   └── VAT_Refund.xlsx     # Official template
+├── scripts/
+│   ├── com.vatbot.bot.plist  # launchd unit for auto-start on login
+│   └── build_tutorial.py     # Generates the user-facing PDF tutorial
+├── logs/                   # Daily-rotating bot.log files
+├── backups/                # mongodump snapshots (one per day)
 ├── run_bot.sh              # One-command Mac setup & launcher
 ├── requirements.txt
 ├── .env.example
@@ -86,11 +99,23 @@ vat-bot/
 
 - **python-telegram-bot 21** — bot framework (async)
 - **MongoDB Community + Motor + GridFS** — local receipt storage (free, no cloud needed)
-- **OpenCV + Pillow** — auto-crop receipts via contour detection + perspective warp
-- **pyzbar / zxing-cpp** — QR code decoding
-- **httpx + BeautifulSoup** — async scraping of soliq.uz / ofd.soliq.uz
+- **OpenCV + Pillow + pillow-heif** — auto-crop receipts via contour detection + perspective warp; HEIC support for iPhone photos
+- **zxing-cpp** — QR code decoding (replaced `pyzbar` to avoid macOS segfaults)
+- **RapidOCR + ONNX Runtime** — optional OCR fallback for unreadable QRs
+- **httpx + BeautifulSoup + lxml** — async scraping of soliq.uz / ofd.soliq.uz
 - **openpyxl** — fill the official XLSX template
 - **reportlab** — generate PDF package
+- **APScheduler** — nightly self-maintenance jobs
+
+## Self-managed service
+
+V5 runs as a self-maintaining service on the host Mac. No external monitor or cron is required.
+
+- **Nightly backup** at 03:30 UTC: `mongodump` snapshot under `backups/`, one folder per day. Old snapshots are pruned automatically (the most recent 7 are kept).
+- **Startup catch-up**: if the Mac was asleep at 03:30 and the latest backup is older than 24 h, a backup runs as soon as the bot starts.
+- **Disk check**: each maintenance run logs free space and warns if the volume drops below 10 GB free.
+- **Daily log rotation**: `logs/bot.log` rotates every night at midnight; old days stay as `bot.log.YYYY-MM-DD`.
+- **Auto-start on login**: `scripts/com.vatbot.bot.plist` is a ready-made launchd unit. Copy it to `~/Library/LaunchAgents/` and `launchctl load` it once — the bot will start at every Mac login and restart if it crashes.
 
 ## How the soliq.uz scraper works
 
@@ -109,9 +134,9 @@ This gives the **authoritative** VAT amount straight from the tax authority — 
 
 ## Notes & limitations
 
-- **Template capacity**: 120 receipts (30 per sheet × 4 sheets). The bot warns if you exceed this.
+- **Template capacity**: 120 receipts per workbook (30 per sheet × 4 sheets). When receipts span more than one calendar year, `/export_vat` produces one workbook per year, each with its own running totals on the continuation sheets.
 - **Duplicate detection**: the same receipt number can't be added twice per user.
-- **soliq.uz availability**: if soliq.uz is down, the bot tells the user and doesn't save a broken record.
+- **soliq.uz availability**: if soliq.uz is down, the bot tells the user and doesn't save a broken record. `/manual` is the fallback when a QR genuinely can't be read.
 - **Privacy**: receipts are stored per Telegram user ID. Only you can see your receipts.
 - **Geo-blocking**: the bot must run on a machine with a Uzbekistan IP. Cloud providers (AWS, Railway, Render, Fly.io) are blocked.
 - **WiFi can't reach soliq.uz?** Some local WiFi ISPs block `ofd.soliq.uz` even inside Uzbekistan. Workarounds:
