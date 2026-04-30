@@ -14,6 +14,21 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # something clickable in Telegram ("@ShiraliDT") for best UX.
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "Shirali DT").strip()
 
+# Comma-separated Telegram user IDs allowed to call hidden admin commands
+# like /heartcheck. The command returns silently for everyone else, so
+# leaving this empty effectively disables the admin surface.
+ADMIN_TELEGRAM_IDS: set[int] = {
+    int(x) for x in (os.getenv("ADMIN_TELEGRAM_IDS", "")).split(",") if x.strip().isdigit()
+}
+
+# Comma-separated Telegram user IDs of DT staff who approve new-user requests.
+# When someone runs /start for the first time, these people receive a
+# Telegram message with Approve/Deny buttons. Anyone not on this list cannot
+# approve users, even if they are an ADMIN_TELEGRAM_IDS technical admin.
+APPROVER_TELEGRAM_IDS: set[int] = {
+    int(x) for x in (os.getenv("APPROVER_TELEGRAM_IDS", "")).split(",") if x.strip().isdigit()
+}
+
 # MongoDB
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 MONGODB_DB = os.getenv("MONGODB_DB", "vat_bot")

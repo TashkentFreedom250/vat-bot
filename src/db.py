@@ -76,12 +76,25 @@ def get_fs() -> AsyncIOMotorGridFSBucket:
 async def ensure_indexes() -> None:
     db = get_db()
     await db.users.create_index("telegram_id", unique=True)
+    await db.users.create_index("status")
     await db.receipts.create_index([("telegram_id", 1), ("created_at", -1)])
     await db.receipts.create_index(
         [("telegram_id", 1), ("receipt_number", 1)], unique=True, sparse=True
     )
     await db.pending_receipts.create_index("telegram_id", unique=True)
     await db.pending_receipts.create_index("expires_at", expireAfterSeconds=0)
+
+
+async def migrate_legacy_users_to_approved() -> int:
+    """Pre-seed access control: any user already in the DB before access
+    control was introduced is grandfathered in as approved. Idempotent —
+    running it again is a no-op once everyone has a status."""
+    db = get_db()
+    result = await db.users.update_many(
+        {"status": {"$exists": False}},
+        {"$set": {"status": "approved", "approved_at": datetime.utcnow(), "approved_by": "legacy_migration"}},
+    )
+    return result.modified_count
 
 
 async def ping() -> None:
@@ -93,7 +106,13 @@ async def upsert_user(telegram_id: int, name: str) -> None:
     """Create a user record on first contact, but never overwrite the name
     the user set themselves via /setname. `name` here is the Telegram
     display name — only useful as a default; exports rely on the name the
-    user explicitly chose."""
+    user explicitly chose.
+
+    Note: this never sets `status`. Access control routes new users through
+    register_pending_user() in /start. Callers that just want to refresh the
+    display name on photo/text handlers can keep using upsert_user — but the
+    gate (_require_approved) will block unapproved users before any work
+    happens."""
     db = get_db()
     await db.users.update_one(
         {"telegram_id": telegram_id},
@@ -101,6 +120,89 @@ async def upsert_user(telegram_id: int, name: str) -> None:
             "$setOnInsert": {
                 "name": name,
                 "created_at": datetime.utcnow(),
+            },
+        },
+        upsert=True,
+    )
+
+
+async def register_pending_user(telegram_id: int, name: str, username: Optional[str]) -> str:
+    """Record a /start from a stranger. Returns the resulting status:
+    'approved' / 'pending' / 'denied' / 'new_pending' (just inserted).
+
+    Existing users keep their status — re-running /start never resets a
+    denial or downgrades an approval. New users are inserted with
+    status='pending' and an approval request is sent by the caller."""
+    db = get_db()
+    existing = await db.users.find_one({"telegram_id": telegram_id})
+    if existing and existing.get("status"):
+        return existing["status"]
+    now = datetime.utcnow()
+    if existing:
+        # Legacy row without a status that somehow slipped past migration —
+        # treat it as approved (same grandfather rule).
+        await db.users.update_one(
+            {"telegram_id": telegram_id},
+            {"$set": {"status": "approved", "approved_at": now, "approved_by": "legacy_implicit"}},
+        )
+        return "approved"
+    await db.users.insert_one({
+        "telegram_id": telegram_id,
+        "name": name,
+        "username": username,
+        "status": "pending",
+        "requested_at": now,
+        "created_at": now,
+    })
+    return "new_pending"
+
+
+async def get_user_status(telegram_id: int) -> Optional[str]:
+    """Return 'approved' / 'pending' / 'denied' / None (= unknown user)."""
+    db = get_db()
+    doc = await db.users.find_one({"telegram_id": telegram_id}, {"status": 1})
+    return doc.get("status") if doc else None
+
+
+async def set_user_status(telegram_id: int, status: str, approver_id: Optional[int]) -> bool:
+    """Approve or deny a user. Returns True if a row was actually updated."""
+    db = get_db()
+    field = "approved" if status == "approved" else "denied"
+    result = await db.users.update_one(
+        {"telegram_id": telegram_id},
+        {"$set": {
+            "status": status,
+            f"{field}_at": datetime.utcnow(),
+            f"{field}_by": approver_id,
+        }},
+    )
+    return result.modified_count > 0
+
+
+async def list_pending_users() -> list[dict]:
+    db = get_db()
+    cursor = db.users.find({"status": "pending"}).sort("requested_at", 1)
+    return [u async for u in cursor]
+
+
+async def ensure_approver_user(telegram_id: int, name: str) -> None:
+    """Lazily insert/upgrade a DT approver's user row to status=approved.
+    Called whenever an approver interacts with the bot — guarantees they
+    can use receipt commands without going through the approval queue.
+    Never overwrites an existing user's name (user-set name wins via /setname)."""
+    db = get_db()
+    now = datetime.utcnow()
+    await db.users.update_one(
+        {"telegram_id": telegram_id},
+        {
+            "$set": {
+                "status": "approved",
+                "approved_at": now,
+                "approved_by": "approver_whitelist",
+            },
+            "$setOnInsert": {
+                "name": name,
+                "created_at": now,
             },
         },
         upsert=True,

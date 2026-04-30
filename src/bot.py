@@ -24,10 +24,11 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from telegram import BotCommand, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -74,6 +75,10 @@ _configure_logging()
 logger = logging.getLogger("vat_bot")
 SAVE_DEBUG_IMAGES = os.getenv("SAVE_DEBUG_IMAGES", "").lower() in {"1", "true", "yes"}
 
+# Wall-clock start of this bot process — used to report uptime in the
+# hidden /heartcheck admin command. Set at import (i.e. process start).
+_PROCESS_START_TS = time.time()
+
 # Image processing (OpenCV, zxing, PIL) releases the GIL — use all cores
 _executor = ThreadPoolExecutor(
     max_workers=(os.cpu_count() or 4) * 2,
@@ -82,7 +87,17 @@ _executor = ThreadPoolExecutor(
 
 
 async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Unhandled exception while processing an update.", exc_info=ctx.error)
+    from telegram.error import NetworkError, TimedOut
+    err = ctx.error
+    # Transient connectivity hiccups (DNS blips, Mac WiFi sleep, brief
+    # api.telegram.org reachability gaps) are already retried internally by
+    # python-telegram-bot's polling loop and self-heal within seconds. Logging
+    # the full traceback at ERROR makes routine network noise look like a
+    # crash in /heartcheck — record a one-line WARNING instead.
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.warning("Transient network error (auto-retried): %s", err)
+        return
+    logger.error("Unhandled exception while processing an update.", exc_info=err)
 
 
 def _display_vendor(doc: dict) -> str:
@@ -229,37 +244,246 @@ async def _save_verified_receipt(
     )
 
 
+# ---------- Access control ----------
+
+def _is_approver(uid: int) -> bool:
+    return uid in config.APPROVER_TELEGRAM_IDS
+
+
+async def _require_approved(update: Update) -> bool:
+    """Gate ordinary commands and message handlers. Returns True if the
+    caller is approved. Otherwise replies with the right message and
+    returns False so the caller can early-exit.
+
+    DT approvers (APPROVER_TELEGRAM_IDS) bypass the gate entirely: the
+    whitelist is more authoritative than the DB. On first interaction we
+    lazily create their user row as approved so /list, /export_vat etc.
+    have something to attach to."""
+    uid = update.effective_user.id
+    user = update.effective_user
+    if _is_approver(uid):
+        await db.ensure_approver_user(
+            uid, user.full_name or user.username or str(uid)
+        )
+        return True
+    status = await db.get_user_status(uid)
+    if status == "approved":
+        return True
+    if update.message is None:
+        return False
+    if status == "pending":
+        await update.message.reply_text(
+            "Your access request is being reviewed by DT. "
+            "You will get a message here when approved."
+        )
+    elif status == "denied":
+        await update.message.reply_text(
+            "Your access request was not approved. "
+            f"Please contact {config.SUPPORT_CONTACT} directly if this is a mistake."
+        )
+    else:
+        # Unknown user who skipped /start — point them at it.
+        await update.message.reply_text(
+            "This bot is restricted to approved users. "
+            "Tap /start to request access from DT."
+        )
+    return False
+
+
+async def _send_approval_request(ctx: ContextTypes.DEFAULT_TYPE, requester) -> None:
+    """Notify every DT approver that a new user is waiting. Each approver
+    gets the same message + Approve/Deny inline buttons; whoever taps first
+    wins, and the buttons no-op for everyone else (the user's status will
+    no longer be 'pending')."""
+    if not config.APPROVER_TELEGRAM_IDS:
+        logger.warning(
+            "New user %s requested access but APPROVER_TELEGRAM_IDS is empty — "
+            "nobody will be notified.", requester.id,
+        )
+        return
+    name = escape(requester.full_name or "(no name)")
+    handle = f"@{escape(requester.username)}" if requester.username else "<i>(no username)</i>"
+    text = (
+        "<b>🔐 New access request</b>\n\n"
+        f"Name: <b>{name}</b>\n"
+        f"Telegram: {handle}\n"
+        f"User ID: <code>{requester.id}</code>\n\n"
+        "Approve to let them use the VAT bot."
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"access:approve:{requester.id}"),
+        InlineKeyboardButton("❌ Deny", callback_data=f"access:deny:{requester.id}"),
+    ]])
+    for approver_id in config.APPROVER_TELEGRAM_IDS:
+        try:
+            await ctx.bot.send_message(approver_id, text, parse_mode="HTML", reply_markup=kb)
+        except Exception:
+            logger.exception("Failed to notify approver %s", approver_id)
+
+
+async def access_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the inline Approve/Deny buttons sent to DT approvers."""
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("access:"):
+        return
+    clicker_id = query.from_user.id
+    if not _is_approver(clicker_id):
+        await query.answer("You are not authorized to approve users.", show_alert=True)
+        return
+
+    try:
+        _, action, target_str = query.data.split(":", 2)
+        target_id = int(target_str)
+    except ValueError:
+        await query.answer("Bad request data.", show_alert=True)
+        return
+
+    current = await db.get_user_status(target_id)
+    if current != "pending":
+        await query.answer(
+            f"Already handled — current status: {current or 'unknown'}.",
+            show_alert=True,
+        )
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    new_status = "approved" if action == "approve" else "denied"
+    await db.set_user_status(target_id, new_status, clicker_id)
+
+    # Update the approver-facing message so other approvers see it's handled.
+    decided_by = escape(query.from_user.full_name or str(clicker_id))
+    verb = "✅ Approved" if new_status == "approved" else "❌ Denied"
+    try:
+        original = query.message.text_html if query.message else ""
+        await query.edit_message_text(
+            f"{original}\n\n<b>{verb}</b> by {decided_by}",
+            parse_mode="HTML",
+        )
+    except Exception:
+        # If editing fails (e.g. message too old), at least drop the buttons.
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    # Tell the user.
+    if new_status == "approved":
+        try:
+            await ctx.bot.send_message(
+                target_id,
+                "<b>✅ You're approved!</b>\n\n"
+                "You can now use the VAT bot. Tap /start to see what's available, "
+                "or just send a receipt photo to get going.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.exception("Couldn't notify approved user %s", target_id)
+    else:
+        try:
+            await ctx.bot.send_message(
+                target_id,
+                "Your access request was not approved. "
+                f"Please contact {config.SUPPORT_CONTACT} directly if this is a mistake.",
+            )
+        except Exception:
+            logger.exception("Couldn't notify denied user %s", target_id)
+
+    await query.answer("Done.")
+
+
 # ---------- Commands ----------
+
+_WELCOME_HTML = (
+    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.5.0</b>\n"
+    "Hi <b>{first_name}</b>! Send receipts as <b>files</b> (paperclip → File) "
+    "for best QR results. I'll read the QR, fetch VAT from soliq.uz, and store it. "
+    "If the QR is damaged or unreadable, use <b>/manual</b> to type the receipt in.\n\n"
+    "<b>Commands</b>\n"
+    "/setname — your name for exports\n"
+    "/manual — add a receipt manually (QR unreadable)\n"
+    "/list — show stored receipts\n"
+    "/export_vat — download VAT_Refund.xlsx\n"
+    "/export_pdf — download receipts PDF\n"
+    "/cancel_pending — discard a pending receipt\n"
+    "/cancel_manual — abort a manual entry\n"
+    "/reset — delete everything\n\n"
+    "Need help? Contact <b>{support}</b>.\n"
+    "⚖️ <i>MIT License — free to use, modify, and share.</i>"
+)
+
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    await db.upsert_user(user.id, user.full_name or user.username or str(user.id))
     first_name = escape(user.first_name or "there")
-    await update.message.reply_text(
-        f"<b>🇺🇸 Tashkent Embassy VAT Refund — V.5.0</b>\n"
-        f"Hi <b>{first_name}</b>! Send receipts as <b>files</b> (paperclip → File) "
-        f"for best QR results. I'll read the QR, fetch VAT from soliq.uz, and store it. "
-        f"If the QR is damaged or unreadable, use <b>/manual</b> to type the receipt in.\n\n"
-        "<b>Commands</b>\n"
-        "/setname — your name for exports\n"
-        "/manual — add a receipt manually (QR unreadable)\n"
-        "/list — show stored receipts\n"
-        "/export_vat — download VAT_Refund.xlsx\n"
-        "/export_pdf — download receipts PDF\n"
-        "/cancel_pending — discard a pending receipt\n"
-        "/cancel_manual — abort a manual entry\n"
-        "/reset — delete everything\n\n"
-        f"Need help? Contact <b>{escape(config.SUPPORT_CONTACT)}</b>.\n"
-        "⚖️ <i>MIT License — free to use, modify, and share.</i>",
-        parse_mode="HTML",
+
+    # DT approvers always get the welcome — they don't go through the queue.
+    if _is_approver(user.id):
+        await db.ensure_approver_user(
+            user.id, user.full_name or user.username or str(user.id)
+        )
+        await update.message.reply_text(
+            _WELCOME_HTML.format(first_name=first_name, support=escape(config.SUPPORT_CONTACT)),
+            parse_mode="HTML",
+        )
+        return
+
+    status = await db.register_pending_user(
+        user.id,
+        user.full_name or user.username or str(user.id),
+        user.username,
     )
+
+    if status == "approved":
+        await update.message.reply_text(
+            _WELCOME_HTML.format(first_name=first_name, support=escape(config.SUPPORT_CONTACT)),
+            parse_mode="HTML",
+        )
+        return
+
+    if status == "denied":
+        await update.message.reply_text(
+            "Your previous access request was not approved. "
+            f"Please contact {config.SUPPORT_CONTACT} directly if this is a mistake."
+        )
+        return
+
+    if status == "pending":
+        await update.message.reply_text(
+            "Your access request is still being reviewed by DT. "
+            "You will get a message here when approved."
+        )
+        return
+
+    # status == "new_pending" — first /start, just inserted as pending.
+    await update.message.reply_text(
+        "Request submitted to DT. You will get a message here when approved."
+    )
+    await _send_approval_request(ctx, user)
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await cmd_start(update, ctx)
 
 
+async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Tell the caller their own Telegram user ID. Useful for collecting
+    APPROVER_TELEGRAM_IDS — each DT staffer runs /whoami once and reports
+    their number to the bot owner. Available to everyone, no gate."""
+    user = update.effective_user
+    handle = f"@{user.username}" if user.username else "(no username)"
+    await update.message.reply_text(
+        f"Telegram user ID: {user.id}\n"
+        f"Username: {handle}\n"
+        f"Name: {user.full_name}"
+    )
+
+
 async def cmd_setname(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_approved(update):
+        return
     if ctx.args:
         name = " ".join(ctx.args).strip()
         await db.set_user_name(update.effective_user.id, name)
@@ -276,6 +500,8 @@ async def cmd_setname(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_approved(update):
+        return
     receipts = await db.list_receipts(update.effective_user.id)
     if not receipts:
         await update.message.reply_text("No receipts yet. Send me a photo to add one!")
@@ -336,6 +562,8 @@ def _sorted_year_keys(groups: dict[str, list[dict]]) -> list[str]:
 
 
 async def cmd_export_vat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_approved(update):
+        return
     uid = update.effective_user.id
     receipts = await db.list_receipts(uid)
     if not receipts:
@@ -382,6 +610,8 @@ async def cmd_export_vat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_export_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_approved(update):
+        return
     uid = update.effective_user.id
     receipts = await db.list_receipts(uid)
     if not receipts:
@@ -434,17 +664,217 @@ async def cmd_export_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_approved(update):
+        return
     await db.delete_pending_receipt(update.effective_user.id)
     n = await db.delete_all_receipts(update.effective_user.id)
     await update.message.reply_text(f"Deleted {n} receipt(s).")
 
 
 async def cmd_cancel_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_approved(update):
+        return
     deleted = await db.delete_pending_receipt(update.effective_user.id)
     if deleted:
         await update.message.reply_text("Pending receipt discarded. You can send a new receipt now.")
         return
     await update.message.reply_text("There is no pending QR retry right now.")
+
+
+# ---------- Hidden admin command ----------
+
+def _format_uptime(seconds: float) -> str:
+    s = int(seconds)
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if d:
+        return f"{d}d {h}h {m}m"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m {s}s"
+
+
+async def _build_heartcheck_report() -> str:
+    import shutil as _shutil
+    from datetime import datetime as _dt, time as _dt_time
+    from . import maintenance
+
+    db_obj = db.get_db()
+
+    # DB ping — most important signal.
+    try:
+        await db.ping()
+        db_status = "✅ reachable"
+    except Exception as e:
+        db_status = f"❌ {type(e).__name__}: {e}"
+
+    # Counts.
+    try:
+        n_users = await db_obj.users.count_documents({})
+        n_receipts = await db_obj.receipts.count_documents({})
+        n_pending = await db_obj.pending_receipts.count_documents({})
+        n_manual = await db_obj.receipts.count_documents({"manual": True})
+        today_start = _dt.combine(_dt.now().date(), _dt_time.min)
+        n_today = await db_obj.receipts.count_documents({"created_at": {"$gte": today_start}})
+        n_images = await db_obj.fs.files.count_documents({})
+        gridfs_bytes = 0
+        async for f in db_obj.fs.files.find({}, {"length": 1}):
+            gridfs_bytes += f.get("length", 0) or 0
+    except Exception:
+        logger.exception("Heartcheck: DB stats failed")
+        n_users = n_receipts = n_pending = n_manual = n_today = n_images = -1
+        gridfs_bytes = 0
+
+    # Last backup info.
+    latest = maintenance._latest_backup()
+    if latest:
+        try:
+            stamp = _dt.strptime(latest.name.replace("vat_bot_", ""), "%Y%m%d_%H%M%S")
+            age = _dt.now() - stamp
+            size_mb = sum(p.stat().st_size for p in latest.rglob("*") if p.is_file()) / 1024 / 1024
+            backup_str = f"{latest.name} ({_format_uptime(age.total_seconds())} ago, {size_mb:.0f} MB)"
+        except Exception:
+            backup_str = latest.name
+    else:
+        backup_str = "none yet"
+
+    # Disk.
+    total, used, free = _shutil.disk_usage("/")
+    disk_pct = int(used * 100 / total)
+    free_gb = free / 1024**3
+
+    # Today's error count from the rotating bot.log.
+    log_path = config.BASE_DIR / "logs" / "bot.log"
+    err_count = 0
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if " ERROR " in line:
+                    err_count += 1
+    except FileNotFoundError:
+        err_count = 0
+    except Exception:
+        err_count = -1
+
+    uptime_str = _format_uptime(time.time() - _PROCESS_START_TS)
+    pid = os.getpid()
+    proxy_note = " (proxy)" if config.SOLIQ_PROXY else ""
+
+    return (
+        "<b>🔧 Heartcheck — V.5.0</b>\n\n"
+        f"Status: ✅ alive\n"
+        f"Uptime: {uptime_str}\n"
+        f"PID: {pid}\n"
+        f"DB: {db_status}\n"
+        f"Soliq route: direct{proxy_note}\n\n"
+        "<b>Activity</b>\n"
+        f"• Users: {n_users}\n"
+        f"• Receipts (total): {n_receipts}  •  manual: {n_manual}\n"
+        f"• Receipts today: {n_today}\n"
+        f"• Pending QR retries: {n_pending}\n"
+        f"• GridFS images: {n_images}  ({gridfs_bytes / 1024 / 1024:.1f} MB)\n\n"
+        "<b>Storage</b>\n"
+        f"• Last backup: {backup_str}\n"
+        f"• Disk: {disk_pct}% full, {free_gb:.1f} GB free\n\n"
+        "<b>Today's log</b>\n"
+        f"• ERROR lines: {err_count}\n"
+    )
+
+
+async def cmd_heartcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hidden admin-only health check. Silently no-ops for non-admins so the
+    command is invisible to ordinary users (it's not in set_my_commands)."""
+    uid = update.effective_user.id
+    if uid not in config.ADMIN_TELEGRAM_IDS:
+        # Stay silent — pretend the bot doesn't know this command.
+        return
+    try:
+        report = await _build_heartcheck_report()
+    except Exception as e:
+        logger.exception("Heartcheck failed")
+        report = f"<b>🔧 Heartcheck</b>\n\n❌ Failed to build report: {type(e).__name__}: {e}"
+    await update.message.reply_text(report, parse_mode="HTML")
+
+
+# ---------- DT-approver commands ----------
+
+async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """List users waiting for DT approval. Silent for non-approvers."""
+    if not _is_approver(update.effective_user.id):
+        return
+    pending = await db.list_pending_users()
+    if not pending:
+        await update.message.reply_text("No pending access requests.")
+        return
+    lines = [f"<b>Pending access requests ({len(pending)})</b>\n"]
+    for u in pending:
+        name = escape(u.get("name") or "(no name)")
+        handle = f"@{escape(u['username'])}" if u.get("username") else "(no username)"
+        when = u.get("requested_at")
+        lines.append(
+            f"• <b>{name}</b> {handle}\n"
+            f"  ID: <code>{u['telegram_id']}</code> · requested {when:%Y-%m-%d %H:%M} UTC"
+        )
+    lines.append("\n<i>To approve:</i> /approve &lt;id&gt;\n<i>To deny:</i> /deny &lt;id&gt;")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def _decide_via_command(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, status: str
+) -> None:
+    if not _is_approver(update.effective_user.id):
+        return
+    if not ctx.args:
+        await update.message.reply_text(
+            f"Usage: /{'approve' if status == 'approved' else 'deny'} <telegram_id>"
+        )
+        return
+    try:
+        target_id = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("That doesn't look like a Telegram ID (must be a number).")
+        return
+    current = await db.get_user_status(target_id)
+    if current is None:
+        await update.message.reply_text(f"No user found with ID {target_id}.")
+        return
+    if current != "pending":
+        await update.message.reply_text(
+            f"User {target_id} is currently '{current}', not pending — nothing to do."
+        )
+        return
+    await db.set_user_status(target_id, status, update.effective_user.id)
+    if status == "approved":
+        try:
+            await ctx.bot.send_message(
+                target_id,
+                "<b>✅ You're approved!</b>\n\n"
+                "You can now use the VAT bot. Tap /start to see what's available, "
+                "or just send a receipt photo to get going.",
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.exception("Couldn't notify approved user %s", target_id)
+        await update.message.reply_text(f"✅ Approved user {target_id}.")
+    else:
+        try:
+            await ctx.bot.send_message(
+                target_id,
+                "Your access request was not approved. "
+                f"Please contact {config.SUPPORT_CONTACT} directly if this is a mistake.",
+            )
+        except Exception:
+            logger.exception("Couldn't notify denied user %s", target_id)
+        await update.message.reply_text(f"❌ Denied user {target_id}.")
+
+
+async def cmd_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _decide_via_command(update, ctx, "approved")
+
+
+async def cmd_deny(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await _decide_via_command(update, ctx, "denied")
 
 
 # ---------- Manual entry (when QR is unreadable) ----------
@@ -488,6 +918,8 @@ def _parse_manual_vat(s: str) -> float | None:
 
 async def cmd_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Start a 4-step manual-entry conversation for receipts whose QR is unreadable."""
+    if not await _require_approved(update):
+        return
     uid = update.effective_user.id
     await db.upsert_user(uid, update.effective_user.full_name or "")
     ctx.user_data.pop("awaiting_name", None)
@@ -517,6 +949,8 @@ async def cmd_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_cancel_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_approved(update):
+        return
     if ctx.user_data.pop("manual_step", None) is not None:
         ctx.user_data.pop("manual_data", None)
         await update.message.reply_text("Manual entry cancelled.")
@@ -633,6 +1067,8 @@ async def _handle_manual_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE, te
 
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Process a receipt photo."""
+    if not await _require_approved(update):
+        return
     msg = update.message
     uid = update.effective_user.id
     await db.upsert_user(uid, update.effective_user.full_name or "")
@@ -782,6 +1218,8 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Accept a pasted soliq.uz URL to complete a pending receipt, OR a name
     typed in response to /setname without arguments."""
+    if not await _require_approved(update):
+        return
     uid = update.effective_user.id
     text = (update.message.text or "").strip()
 
@@ -912,6 +1350,9 @@ async def _post_init(app: Application) -> None:
         try:
             await db.ping()
             await db.ensure_indexes()
+            migrated = await db.migrate_legacy_users_to_approved()
+            if migrated:
+                logger.info("Access control: grandfathered %s legacy user(s) as approved.", migrated)
             deleted = await db.cleanup_orphaned_images()
             if deleted:
                 logger.info("Deleted %s orphaned GridFS image(s).", deleted)
@@ -969,6 +1410,7 @@ def _build_app() -> Application:
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("whoami", cmd_whoami))
     app.add_handler(CommandHandler("setname", cmd_setname))
     app.add_handler(CommandHandler("manual", cmd_manual))
     app.add_handler(CommandHandler("cancel_manual", cmd_cancel_manual))
@@ -977,6 +1419,15 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("export_pdf", cmd_export_pdf))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("cancel_pending", cmd_cancel_pending))
+    # Hidden: not in set_my_commands, silent for non-admins. Admin IDs come
+    # from the ADMIN_TELEGRAM_IDS env var.
+    app.add_handler(CommandHandler("heartcheck", cmd_heartcheck))
+    # DT-approver commands. Silent for non-approvers (APPROVER_TELEGRAM_IDS).
+    app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("approve", cmd_approve))
+    app.add_handler(CommandHandler("deny", cmd_deny))
+    # Inline Approve/Deny buttons on the new-user notification messages.
+    app.add_handler(CallbackQueryHandler(access_callback, pattern=r"^access:"))
 
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
