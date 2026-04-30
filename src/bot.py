@@ -87,7 +87,7 @@ _executor = ThreadPoolExecutor(
 
 
 async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    from telegram.error import NetworkError, TimedOut
+    from telegram.error import Conflict, NetworkError, TimedOut
     err = ctx.error
     # Transient connectivity hiccups (DNS blips, Mac WiFi sleep, brief
     # api.telegram.org reachability gaps) are already retried internally by
@@ -96,6 +96,13 @@ async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # crash in /heartcheck — record a one-line WARNING instead.
     if isinstance(err, (NetworkError, TimedOut)):
         logger.warning("Transient network error (auto-retried): %s", err)
+        return
+    # Conflict means two bot instances briefly polled at the same time
+    # (e.g. during a launchd restart while a manual run was still alive).
+    # The duplicate dies within seconds and the survivor keeps polling, so
+    # this is recovery noise, not an outage.
+    if isinstance(err, Conflict):
+        logger.warning("Polling conflict (duplicate instance, auto-resolved): %s", err)
         return
     logger.error("Unhandled exception while processing an update.", exc_info=err)
 
