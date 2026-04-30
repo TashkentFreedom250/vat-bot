@@ -1,6 +1,6 @@
-# Tashkent Embassy VAT Refund Bot — V5
+# Tashkent Embassy VAT Refund Bot — V6
 
-A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts and file VAT refund requests automatically.
+A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts and file VAT refund requests automatically. Access is gated to approved staff via a DT-managed approval queue.
 
 ## What it does
 
@@ -16,7 +16,7 @@ A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts an
 
 | Command | What it does |
 |---|---|
-| `/start` | Welcome + register |
+| `/start` | Welcome + register (or request access if first-time) |
 | `/setname John Smith` | Set employee name used in exports |
 | *(send photo)* | Add a receipt |
 | `/manual` | Add a receipt by hand when the QR can't be read |
@@ -28,7 +28,33 @@ A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts an
 | `/reset` | Delete all receipts |
 | `/help` | Show help |
 
-A hidden `/heartcheck` command is available to admins listed in `ADMIN_TELEGRAM_IDS`. It returns a quick health snapshot (DB reachable, recent activity) and stays silent for everyone else.
+### Hidden commands
+
+- **DT approvers** (`APPROVER_TELEGRAM_IDS`): `/pending` lists access requests, `/approve <user_id>` and `/deny <user_id>` resolve them via command (in addition to the inline buttons sent on each new request).
+- **Technical admins** (`ADMIN_TELEGRAM_IDS`): `/heartcheck` returns a health snapshot (DB reachable, uptime, GridFS size, backup age, today's error count).
+- **Anyone**: `/whoami` replies with the caller's Telegram ID — used to collect IDs from new DT staff before adding them to `APPROVER_TELEGRAM_IDS`.
+
+All hidden commands silently no-op for anyone not on the relevant list — they don't appear in the Telegram command menu.
+
+## Access control
+
+V6 added a DT-managed approval queue so the bot is restricted to approved staff.
+
+- **First /start**: a stranger lands in a `pending` queue and sees *"Request submitted to DT. You will get a message here when approved."*
+- **DT approvers** receive a Telegram message with the requester's name, username, Telegram ID, and **✅ Approve** / **❌ Deny** inline buttons. Whoever taps first wins; the message edits to show *"Approved by …"* so the others see it's handled. There's no race — the bot rejects the second click as already handled.
+- **Approved**: the user gets a Telegram ping ("You're approved!") and can immediately use the bot.
+- **Denied**: the user gets a polite "contact DT" message and remains unable to use any other command.
+- **Approvers bypass the queue entirely** — anyone in `APPROVER_TELEGRAM_IDS` is treated as approved by definition. Their user row is lazily upserted with `status=approved` on first interaction so they can use receipt commands without going through approval themselves.
+- **Backwards-compatible migration**: when V6 starts for the first time on an existing database, every pre-existing user is grandfathered in as approved. Nobody who was already using the bot is interrupted.
+
+### Onboarding new DT approvers
+
+1. Ask the new approver to message the bot with `/whoami` once.
+2. Add their Telegram ID to `APPROVER_TELEGRAM_IDS` in `.env`, comma-separated:
+   ```
+   APPROVER_TELEGRAM_IDS=7962068286,85189405,1234567890
+   ```
+3. Restart the bot (`launchctl kickstart -k "gui/$(id -u)/com.vatbot.bot"` if running under launchd).
 
 ## Running on Mac (recommended)
 
@@ -109,7 +135,7 @@ vat-bot/
 
 ## Self-managed service
 
-V5 runs as a self-maintaining service on the host Mac. No external monitor or cron is required.
+V6 runs as a self-maintaining service on the host Mac. No external monitor or cron is required.
 
 - **Nightly backup** at 03:30 UTC: `mongodump` snapshot under `backups/`, one folder per day. Old snapshots are pruned automatically (the most recent 7 are kept).
 - **Startup catch-up**: if the Mac was asleep at 03:30 and the latest backup is older than 24 h, a backup runs as soon as the bot starts.
@@ -126,7 +152,7 @@ https://ofd.soliq.uz/epul/?t=<terminal_id>&r=<receipt_no>&c=<date>&s=<amount>
 ```
 
 The bot:
-1. Decodes the QR with `pyzbar`
+1. Decodes the QR with `zxing-cpp`
 2. First tries the structured **JSON endpoint** at `ofd.soliq.uz/check`
 3. Falls back to **HTML scraping** of the consumer-facing receipt page
 

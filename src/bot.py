@@ -404,7 +404,7 @@ async def access_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 # ---------- Commands ----------
 
 _WELCOME_HTML = (
-    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.5.0</b>\n"
+    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.6.0</b>\n"
     "Hi <b>{first_name}</b>! Send receipts as <b>files</b> (paperclip → File) "
     "for best QR results. I'll read the QR, fetch VAT from soliq.uz, and store it. "
     "If the QR is damaged or unreadable, use <b>/manual</b> to type the receipt in.\n\n"
@@ -769,7 +769,7 @@ async def _build_heartcheck_report() -> str:
     proxy_note = " (proxy)" if config.SOLIQ_PROXY else ""
 
     return (
-        "<b>🔧 Heartcheck — V.5.0</b>\n\n"
+        "<b>🔧 Heartcheck — V.6.0</b>\n\n"
         f"Status: ✅ alive\n"
         f"Uptime: {uptime_str}\n"
         f"PID: {pid}\n"
