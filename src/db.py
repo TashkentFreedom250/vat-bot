@@ -309,6 +309,18 @@ async def save_receipt(doc: dict) -> Optional[str]:
         raise
 
 
+async def find_receipt_by_number(telegram_id: int, receipt_number: str) -> Optional[dict]:
+    """Return the existing receipt matching this user + receipt_number, if any.
+    Used by the online-purchase flow and the random-URL inquiry handler to
+    tell users when a receipt is already saved."""
+    if not receipt_number:
+        return None
+    db = get_db()
+    return await db.receipts.find_one(
+        {"telegram_id": telegram_id, "receipt_number": receipt_number}
+    )
+
+
 async def list_receipts(telegram_id: int) -> list[dict]:
     db = get_db()
     cursor = db.receipts.find({"telegram_id": telegram_id}).sort("date", 1)

@@ -25,6 +25,9 @@ from . import config, db
 # E40            = per-sheet SUM (each sheet)
 SHEETS_ORDER = ["Table", "Continuation", "Continuation2", "Continuation3"]
 ROWS_PER_SHEET = 30
+# How many receipts fit in one workbook (4 sheets × 30 rows). Years with
+# more than this need to be split into multiple "copy N" workbooks.
+RECEIPTS_PER_XLSX = len(SHEETS_ORDER) * ROWS_PER_SHEET
 DATA_START_ROW = 9   # First data row (A9 = 1)
 NAME_ROW = 5         # Row of the employee name merged cell D5:E5
 NAME_COL = 4         # Column D
@@ -64,10 +67,19 @@ async def build_xlsx(telegram_id: int, employee_name: str, output_path: Path) ->
 
 
 def build_xlsx_from_receipts(
-    receipts: list[dict], employee_name: str, output_path: Path
+    receipts: list[dict],
+    employee_name: str,
+    output_path: Path,
+    start_seq: int = 1,
 ) -> Path:
     """Render a pre-filtered list of receipts into a fresh copy of the template.
-    Used by /export_vat to produce one workbook per calendar year."""
+    Used by /export_vat to produce one workbook per calendar year.
+
+    `start_seq` is the visible row number printed in column A of the first
+    receipt. Defaults to 1 (a standalone workbook). When a year is split
+    across multiple copies because it exceeds the 120-row template, copy 2
+    passes start_seq=121 so the numbering stays continuous if the tax
+    office staples the copies together."""
     shutil.copy(config.TEMPLATE_PATH, output_path)
     wb = load_workbook(output_path)
 
@@ -92,7 +104,7 @@ def build_xlsx_from_receipts(
         sheet_total = 0.0
         for i, r in enumerate(chunk):
             row = DATA_START_ROW + i
-            seq = idx * ROWS_PER_SHEET + i + 1
+            seq = start_seq + idx * ROWS_PER_SHEET + i
             num_cell = ws.cell(row=row, column=1, value=seq)
             num_cell.number_format = "General"
             # Manual entries: bold the row number so the finance office can

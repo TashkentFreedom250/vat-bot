@@ -35,7 +35,16 @@ from telegram.ext import (
     filters,
 )
 
-from . import config, db, exporter, maintenance, receipt_image, receipt_ocr, soliq
+from . import (
+    config,
+    db,
+    exporter,
+    maintenance,
+    online_snapshot,
+    receipt_image,
+    receipt_ocr,
+    soliq,
+)
 
 
 def _configure_logging() -> None:
@@ -407,15 +416,18 @@ _WELCOME_HTML = (
     "<b>🇺🇸 Tashkent Embassy VAT Refund — V.6.0</b>\n"
     "Hi <b>{first_name}</b>! Send receipts as <b>files</b> (paperclip → File) "
     "for best QR results. I'll read the QR, fetch VAT from soliq.uz, and store it. "
-    "If the QR is damaged or unreadable, use <b>/manual</b> to type the receipt in.\n\n"
+    "If the QR is damaged or unreadable, use <b>/manual</b> to type the receipt in. "
+    "For online purchases (no physical receipt), use <b>/online_purchase</b> with the soliq.uz URL.\n\n"
     "<b>Commands</b>\n"
     "/setname — your name for exports\n"
     "/manual — add a receipt manually (QR unreadable)\n"
+    "/online_purchase — add an online-purchase receipt from a soliq.uz URL\n"
     "/list — show stored receipts\n"
     "/export_vat — download VAT_Refund.xlsx\n"
     "/export_pdf — download receipts PDF\n"
     "/cancel_pending — discard a pending receipt\n"
     "/cancel_manual — abort a manual entry\n"
+    "/cancel_online — abort an online-purchase entry\n"
     "/reset — delete everything\n\n"
     "Need help? Contact <b>{support}</b>.\n"
     "⚖️ <i>MIT License — free to use, modify, and share.</i>"
@@ -590,30 +602,64 @@ async def cmd_export_vat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
     await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
 
+    cap = exporter.RECEIPTS_PER_XLSX
+
     for year in years:
         year_receipts = groups[year]
-        if len(year_receipts) > 120:
+        n_year = len(year_receipts)
+        year_total = sum(float(r.get("vat_amount") or 0) for r in year_receipts)
+
+        # The official template fits cap (120) receipts. If a year goes
+        # past that, split into copy_1, copy_2, ... — each copy keeps the
+        # row numbering continuous so stapled copies read 1..N end-to-end.
+        copies = [
+            year_receipts[i : i + cap] for i in range(0, n_year, cap)
+        ]
+        total_copies = len(copies)
+
+        if total_copies > 1:
             await update.message.reply_text(
-                f"You have {len(year_receipts)} receipts for {year}, but the template "
-                "only fits 120. Only the first 120 will be included for that year."
+                f"You have {n_year} receipts for {year} — that's more than "
+                f"the {cap}-row template fits, so I'll split it into "
+                f"{total_copies} workbooks (copy 1 of {total_copies}, "
+                f"copy 2 of {total_copies}, ...). Row numbers stay "
+                "continuous across copies."
             )
-            year_receipts = year_receipts[:120]
 
-        out_path = config.TMP_DIR / f"VAT_Refund_{year}_{uid}_{uuid.uuid4().hex[:6]}.xlsx"
-        exporter.build_xlsx_from_receipts(year_receipts, name, out_path)
+        for copy_idx, chunk in enumerate(copies, 1):
+            start_seq = (copy_idx - 1) * cap + 1
+            end_seq = start_seq + len(chunk) - 1
+            chunk_total = sum(float(r.get("vat_amount") or 0) for r in chunk)
 
-        total_vat = sum(float(r.get("vat_amount") or 0) for r in year_receipts)
-        caption = (
-            f"VAT for {year} — {len(year_receipts)} receipt(s) — "
-            f"Total: {total_vat:,.2f} UZS"
-        )
-        with open(out_path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=f"VAT_Refund_{year}.xlsx",
-                caption=caption,
+            suffix = f"_copy_{copy_idx}_of_{total_copies}" if total_copies > 1 else ""
+            out_path = (
+                config.TMP_DIR
+                / f"VAT_Refund_{year}{suffix}_{uid}_{uuid.uuid4().hex[:6]}.xlsx"
             )
-        out_path.unlink(missing_ok=True)
+            exporter.build_xlsx_from_receipts(
+                chunk, name, out_path, start_seq=start_seq
+            )
+
+            if total_copies > 1:
+                caption = (
+                    f"VAT {year} — copy {copy_idx} of {total_copies}\n"
+                    f"Receipts #{start_seq}–#{end_seq} ({len(chunk)} in this file)\n"
+                    f"This file: {chunk_total:,.2f} UZS\n"
+                    f"Year total ({n_year} receipts): {year_total:,.2f} UZS"
+                )
+                filename = f"VAT_Refund_{year}_copy_{copy_idx}_of_{total_copies}.xlsx"
+            else:
+                caption = (
+                    f"VAT for {year} — {len(chunk)} receipt(s) — "
+                    f"Total: {chunk_total:,.2f} UZS"
+                )
+                filename = f"VAT_Refund_{year}.xlsx"
+
+            with open(out_path, "rb") as f:
+                await update.message.reply_document(
+                    document=f, filename=filename, caption=caption,
+                )
+            out_path.unlink(missing_ok=True)
 
 
 async def cmd_export_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -965,6 +1011,175 @@ async def cmd_cancel_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text("There is no manual entry in progress.")
 
 
+# ---------- Online purchase flow ----------
+
+def _looks_like_soliq_url(text: str) -> bool:
+    t = text.strip()
+    return t.startswith("http") and "soliq.uz" in t.lower()
+
+
+async def cmd_online_purchase(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add an online-purchase receipt from a soliq.uz URL — no photo needed.
+    A synthetic receipt-style PNG is generated from the verified data so the
+    PDF export still has a visual record."""
+    if not await _require_approved(update):
+        return
+    uid = update.effective_user.id
+    await db.upsert_user(uid, update.effective_user.full_name or "")
+
+    # Allow inline URL: /online_purchase https://ofd.soliq.uz/check?...
+    if ctx.args:
+        url = " ".join(ctx.args).strip()
+        if _looks_like_soliq_url(url):
+            await _save_online_purchase(update, ctx, url)
+            return
+
+    # Otherwise prompt and capture the next text message.
+    ctx.user_data["awaiting_online_url"] = True
+    await update.message.reply_text(
+        "Online purchase mode.\n\n"
+        "Paste the soliq.uz receipt URL (the one the merchant emailed you, "
+        "or the link encoded in the QR on the receipt page). I'll fetch "
+        "the verified VAT data and save the entry — no photo needed.\n\n"
+        "Use /cancel_online to abort."
+    )
+
+
+async def cmd_cancel_online(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_approved(update):
+        return
+    if ctx.user_data.pop("awaiting_online_url", None):
+        await update.message.reply_text("Online purchase entry cancelled.")
+        return
+    await update.message.reply_text("There is no online purchase in progress.")
+
+
+async def _save_online_purchase(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, qr_url: str
+) -> None:
+    uid = update.effective_user.id
+    status = await update.message.reply_text("Fetching verified data from soliq.uz...")
+
+    data, diag = await soliq.fetch_receipt_with_diag(qr_url)
+    if not data:
+        await status.edit_text(
+            "I could not fetch data from soliq.uz for that URL.\n\n"
+            f"Reason: {diag}\n\n"
+            f"Need help? Contact {config.SUPPORT_CONTACT}."
+        )
+        return
+
+    if not data.get("vat_amount"):
+        vendor = data.get("vendor", "") or data.get("receipt_number", "this receipt")
+        await status.edit_text(
+            f"This receipt ({vendor}) has 0 VAT — nothing to refund.\n"
+            "It will not be added to your records."
+        )
+        return
+
+    receipt_no = data.get("receipt_number", "")
+    existing = await db.find_receipt_by_number(uid, receipt_no)
+    if existing:
+        await status.edit_text(
+            f"This receipt (#{receipt_no}) is already in your records — "
+            f"saved on {existing.get('created_at', '?')}."
+        )
+        return
+
+    # Build the synthetic snapshot and save it as the receipt's image.
+    loop = asyncio.get_running_loop()
+    try:
+        png_bytes = await loop.run_in_executor(
+            None, online_snapshot.render_online_receipt_png, data, qr_url
+        )
+        file_id = await db.save_image(uid, png_bytes, f"online_{uid}.png")
+    except Exception:
+        logger.exception("Online snapshot render/save failed")
+        # Save the receipt without an image rather than dropping the entry.
+        file_id = None
+
+    receipt_doc = {
+        "telegram_id": uid,
+        "image_file_id": file_id,
+        "qr_image_file_id": None,
+        "date": data.get("date", ""),
+        "vendor": data.get("vendor", ""),
+        "printed_vendor": "",
+        "display_vendor": data.get("vendor", ""),
+        "receipt_number": receipt_no,
+        "vat_amount": data.get("vat_amount", 0.0),
+        "total_amount": data.get("total_amount", 0.0),
+        "soliq_url": qr_url,
+        "raw_qr": qr_url,
+        "online_purchase": True,
+    }
+    inserted = await db.save_receipt(receipt_doc)
+    if inserted is None:
+        await status.edit_text(
+            f"This receipt (#{receipt_no}) is already in your records."
+        )
+        return
+
+    count = await db.count_receipts(uid)
+    await status.edit_text(
+        f"Online purchase added (#{count})\n\n"
+        f"Vendor: {data.get('vendor', '-') or '-'}\n"
+        f"Date: {data.get('date', '-')}\n"
+        f"Receipt #: {receipt_no or '-'}\n"
+        f"Total: {data.get('total_amount', 0):,.2f} UZS\n"
+        f"VAT: {data.get('vat_amount', 0):,.2f} UZS\n"
+        "Verified tax data source: soliq.uz"
+    )
+
+
+async def _handle_random_soliq_url(
+    update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str
+) -> None:
+    """Inquiry-only handler when a user pastes a soliq.uz URL with no
+    pending receipt. Tells them whether the receipt is already on file
+    and, if not, points them at the right next step."""
+    uid = update.effective_user.id
+    status = await update.message.reply_text("Checking soliq.uz...")
+
+    data, diag = await soliq.fetch_receipt_with_diag(text)
+    if not data:
+        await status.edit_text(
+            "I could not fetch data from soliq.uz for that URL.\n\n"
+            f"Reason: {diag}"
+        )
+        return
+
+    receipt_no = data.get("receipt_number", "")
+    existing = await db.find_receipt_by_number(uid, receipt_no)
+    if existing:
+        when = existing.get("created_at")
+        when_str = when.strftime("%Y-%m-%d") if hasattr(when, "strftime") else "?"
+        await status.edit_text(
+            f"This receipt is already in your records.\n\n"
+            f"Vendor: {existing.get('display_vendor', '-') or '-'}\n"
+            f"Date: {existing.get('date', '-') or '-'}\n"
+            f"Receipt #: {receipt_no or '-'}\n"
+            f"VAT: {float(existing.get('vat_amount') or 0):,.2f} UZS\n"
+            f"Saved on: {when_str}"
+        )
+        return
+
+    vendor = data.get("vendor", "") or "-"
+    await status.edit_text(
+        "I have the tax data for this receipt — but it's not saved yet.\n\n"
+        f"Vendor: {vendor}\n"
+        f"Date: {data.get('date', '-') or '-'}\n"
+        f"Receipt #: {receipt_no or '-'}\n"
+        f"VAT: {float(data.get('vat_amount') or 0):,.2f} UZS\n\n"
+        "To save it:\n"
+        "• Send a <b>photo</b> of the physical receipt to add it the normal way.\n"
+        "• If this was an <b>online purchase</b> (no physical receipt), run "
+        "/online_purchase and paste the link again — I'll save it with a "
+        "verified snapshot.",
+        parse_mode="HTML",
+    )
+
+
 async def _handle_manual_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     step = ctx.user_data.get("manual_step")
     data = ctx.user_data.setdefault("manual_data", {})
@@ -1236,6 +1451,23 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _handle_manual_step(update, ctx, text)
         return
 
+    # /online_purchase mode — next message is the soliq.uz URL.
+    if ctx.user_data.get("awaiting_online_url"):
+        ctx.user_data.pop("awaiting_online_url", None)
+        if text.startswith("/"):
+            await update.message.reply_text(
+                "Online purchase entry cancelled (you sent a command)."
+            )
+            return
+        if not _looks_like_soliq_url(text):
+            await update.message.reply_text(
+                "That didn't look like a soliq.uz URL. Cancelled.\n\n"
+                "Run /online_purchase again and paste the link."
+            )
+            return
+        await _save_online_purchase(update, ctx, text)
+        return
+
     # If the user clicked /setname (no args), their next plain-text message
     # is treated as their name. Guard against accidents: pasted URLs or
     # empty text don't make sense as names.
@@ -1254,6 +1486,14 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     pending = await db.get_pending_receipt(uid)
+
+    # Random soliq.uz URL paste with no pending photo: treat as an inquiry.
+    # Check if the receipt is already saved; if not, prompt the user to
+    # either send a photo or run /online_purchase.
+    if not pending and _looks_like_soliq_url(text):
+        await _handle_random_soliq_url(update, ctx, text)
+        return
+
     if not pending:
         return
 
@@ -1307,11 +1547,13 @@ _BOT_COMMANDS = [
     BotCommand("start", "Welcome + show help"),
     BotCommand("setname", "Set your name for exports"),
     BotCommand("manual", "Add a receipt manually (when QR is unreadable)"),
+    BotCommand("online_purchase", "Add an online-purchase receipt from a soliq.uz URL"),
     BotCommand("list", "Show stored receipts"),
     BotCommand("export_vat", "Download VAT_Refund.xlsx"),
     BotCommand("export_pdf", "Download PDF of all receipts"),
     BotCommand("cancel_pending", "Discard a receipt waiting for a QR close-up"),
     BotCommand("cancel_manual", "Abort a manual entry in progress"),
+    BotCommand("cancel_online", "Abort an online-purchase entry in progress"),
     BotCommand("reset", "Delete everything"),
     BotCommand("help", "Show help"),
 ]
@@ -1421,6 +1663,8 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("setname", cmd_setname))
     app.add_handler(CommandHandler("manual", cmd_manual))
     app.add_handler(CommandHandler("cancel_manual", cmd_cancel_manual))
+    app.add_handler(CommandHandler("online_purchase", cmd_online_purchase))
+    app.add_handler(CommandHandler("cancel_online", cmd_cancel_online))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("export_vat", cmd_export_vat))
     app.add_handler(CommandHandler("export_pdf", cmd_export_pdf))

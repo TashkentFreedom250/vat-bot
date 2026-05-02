@@ -20,13 +20,17 @@ A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts an
 | `/setname John Smith` | Set employee name used in exports |
 | *(send photo)* | Add a receipt |
 | `/manual` | Add a receipt by hand when the QR can't be read |
+| `/online_purchase` | Add an online-purchase receipt from a soliq.uz URL (no photo needed) |
 | `/cancel_manual` | Abort a manual entry in progress |
+| `/cancel_online` | Abort an online-purchase entry in progress |
 | `/cancel_pending` | Discard a receipt waiting for a QR close-up |
 | `/list` | List all stored receipts |
-| `/export_vat` | Download filled `VAT_Refund.xlsx` (one file per year if needed) |
+| `/export_vat` | Download filled `VAT_Refund.xlsx` (one file per year, split into copies of 120 if needed) |
 | `/export_pdf` | Download PDF package (summary + images) |
 | `/reset` | Delete all receipts |
 | `/help` | Show help |
+
+**Pasting a soliq.uz URL into the chat (no other context)** triggers an inquiry: the bot fetches the receipt data and either tells you it's already saved (with the original save date) or shows the data and points you at `/online_purchase` (for online buys) or sending a photo (for physical receipts).
 
 ### Hidden commands
 
@@ -105,8 +109,9 @@ vat-bot/
 │   ├── db.py               # MongoDB + GridFS (async)
 │   ├── receipt_image.py    # Auto-crop + QR decode
 │   ├── receipt_ocr.py      # Optional OCR fallback (RapidOCR)
+│   ├── online_snapshot.py  # Synthetic PNG for /online_purchase entries
 │   ├── soliq.py            # Fetch verified VAT data from soliq.uz
-│   ├── exporter.py         # XLSX + PDF export (year-split aware)
+│   ├── exporter.py         # XLSX + PDF export (year-split + copy-split aware)
 │   └── maintenance.py      # Nightly backup + disk/log housekeeping
 ├── templates/
 │   └── VAT_Refund.xlsx     # Official template
@@ -160,7 +165,8 @@ This gives the **authoritative** VAT amount straight from the tax authority — 
 
 ## Notes & limitations
 
-- **Template capacity**: 120 receipts per workbook (30 per sheet × 4 sheets). When receipts span more than one calendar year, `/export_vat` produces one workbook per year, each with its own running totals on the continuation sheets.
+- **Template capacity**: 120 receipts per workbook (30 per sheet × 4 sheets). When receipts span more than one calendar year, `/export_vat` produces one workbook per year, each with its own running totals on the continuation sheets. If a single year exceeds 120 receipts, the year is split into multiple workbooks (`VAT_Refund_2026_copy_1_of_3.xlsx`, `…_copy_2_of_3.xlsx`, `…_copy_3_of_3.xlsx`) with continuous row numbers (1–120, 121–240, …) so the copies read as one document if stapled together.
+- **Online purchases**: `/online_purchase` accepts a soliq.uz URL with no photo. The bot fetches the verified VAT data and renders a clean snapshot PNG (vendor, date, totals, scannable QR) which is stored in GridFS and included in the PDF export, so finance still has a visual record of every entry.
 - **Duplicate detection**: the same receipt number can't be added twice per user.
 - **soliq.uz availability**: if soliq.uz is down, the bot tells the user and doesn't save a broken record. `/manual` is the fallback when a QR genuinely can't be read.
 - **Privacy**: receipts are stored per Telegram user ID. Only you can see your receipts.
