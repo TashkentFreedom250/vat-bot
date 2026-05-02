@@ -176,6 +176,28 @@ def _format_ocr_preview(preview: dict, intro: str = "I couldn't verify the QR co
     return "\n".join(lines)
 
 
+async def _keep_typing(bot, chat_id: int, interval: float = 4.0) -> None:
+    """Keep Telegram's "is typing..." indicator alive while a slow
+    operation runs. Telegram drops the chat action after ~5 seconds, so
+    we re-fire it on a short loop until cancelled. Used during photo
+    processing because OCR + multi-soliq lookups can take 5-15 seconds
+    on long receipts and the user starts wondering if the bot is hung.
+    """
+    try:
+        while True:
+            try:
+                await bot.send_chat_action(chat_id, ChatAction.TYPING)
+            except Exception:
+                # Don't let a transient send_chat_action failure kill the
+                # processing loop. Worst case the typing indicator just
+                # disappears for a few seconds.
+                logger.debug("Typing keep-alive ping failed (non-fatal)", exc_info=True)
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        # Normal shutdown when the parent finishes the request.
+        pass
+
+
 async def _decode_qr(loop: asyncio.AbstractEventLoop, image_bytes: bytes, cropped_bytes: bytes) -> str | None:
     try:
         # Try both images concurrently — crop and original are independent inputs
@@ -422,7 +444,7 @@ async def access_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 # ---------- Commands ----------
 
 _WELCOME_HTML = (
-    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.7.0</b>\n\n"
+    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.8.0</b>\n\n"
     "Hi <b>{first_name}</b>! 👋\n\n"
     "<b>To add a receipt:</b> just send me a photo. That's it — "
     "I do the rest.\n\n"
@@ -882,7 +904,7 @@ async def _build_heartcheck_report() -> str:
     proxy_note = " (proxy)" if config.SOLIQ_PROXY else ""
 
     return (
-        "<b>🔧 Heartcheck — V.7.0</b>\n\n"
+        "<b>🔧 Heartcheck — V.8.0</b>\n\n"
         f"Status: ✅ alive\n"
         f"Uptime: {uptime_str}\n"
         f"PID: {pid}\n"
@@ -1379,6 +1401,36 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await ctx.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
     status = await msg.reply_text("Got it, processing...")
 
+    # Keep the "is typing..." indicator alive for the full duration of
+    # processing — long receipts can spend 5-15 seconds in OCR fallback
+    # plus multiple soliq.uz round-trips, well past Telegram's ~5s
+    # auto-timeout on chat actions. Without this, users see the
+    # "processing..." status sit silent and assume the bot is hung.
+    typing_task = asyncio.create_task(_keep_typing(ctx.bot, msg.chat_id))
+    try:
+        await _process_photo(
+            update=update, ctx=ctx, msg=msg, uid=uid,
+            tg_file=tg_file, status=status,
+        )
+    finally:
+        typing_task.cancel()
+        try:
+            await typing_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+async def _process_photo(
+    *,
+    update: Update,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    msg,
+    uid: int,
+    tg_file,
+    status,
+) -> None:
+    """Body of the photo handler — extracted so handle_photo can wrap it
+    in a typing-keepalive try/finally without indenting the whole block."""
     try:
         image_bytes = bytes(await tg_file.download_as_bytearray())
     except Exception as e:
@@ -1433,6 +1485,14 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # so worst case behavior is identical to before.
     ocr_recovered = False
     if not qr_url:
+        # Tell the user we're still working — OCR + multiple soliq round
+        # trips can take a few seconds on long receipts. The typing
+        # indicator is alive too, but a concrete message reassures users
+        # who have learned to ignore the typing dots.
+        try:
+            await status.edit_text("QR is small — scanning the receipt text...")
+        except Exception:
+            pass
         try:
             candidates = await loop.run_in_executor(
                 None, receipt_ocr.extract_soliq_url_candidates, image_bytes

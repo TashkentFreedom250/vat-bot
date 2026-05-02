@@ -1,4 +1,4 @@
-# Tashkent Embassy VAT Refund Bot — V7
+# Tashkent Embassy VAT Refund Bot — V8
 
 A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts and file VAT refund requests automatically. Access is gated to approved staff via a DT-managed approval queue.
 
@@ -140,7 +140,7 @@ vat-bot/
 
 ## Self-managed service
 
-V7 runs as a self-maintaining service on the host Mac. No external monitor or cron is required.
+V8 runs as a self-maintaining service on the host Mac. No external monitor or cron is required.
 
 - **Nightly backup** at 03:30 UTC: `mongodump` snapshot under `backups/`, one folder per day. Old snapshots are pruned automatically (the most recent 7 are kept).
 - **Startup catch-up**: if the Mac was asleep at 03:30 and the latest backup is older than 24 h, a backup runs as soon as the bot starts.
