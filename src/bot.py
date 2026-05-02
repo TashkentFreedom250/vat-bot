@@ -445,14 +445,27 @@ async def access_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
 _WELCOME_HTML = (
     "<b>🇺🇸 Tashkent Embassy VAT Refund — V.8.0</b>\n\n"
-    "Hi <b>{first_name}</b>! 👋\n\n"
-    "<b>To add a receipt:</b> just send me a photo. That's it — "
-    "I do the rest.\n\n"
-    "<b>When you're ready to file:</b>\n"
-    "• /export_vat — official Excel form\n"
-    "• /export_pdf — receipt images package\n\n"
-    "<b>First time?</b> Run /setname so the forms have your name on them.\n\n"
-    "Tap <b>/</b> in the message box to see every command.\n\n"
+    "Hi <b>{first_name}</b>! 👋\n"
+    "Just send me a 📸 photo of any receipt — I read the QR and save it.\n\n"
+
+    "<b>📥 Adding receipts</b>\n"
+    "• Send a <b>photo</b> (best as a <i>File</i> via the paperclip)\n"
+    "• /manual — type by hand (last resort)\n"
+    "• /online_purchase — online buys with a soliq.uz link\n\n"
+
+    "<b>📋 Review &amp; file</b>\n"
+    "• /list — see your saved receipts\n"
+    "• /export_vat — download the official Excel form\n"
+    "• /export_pdf — download the receipt images PDF\n\n"
+
+    "<b>⚙️ Setup &amp; control</b>\n"
+    "• /setname — your name on the forms (do this first!)\n"
+    "• /cancel_pending — discard a stuck receipt\n"
+    "• /cancel_manual — abort a manual entry\n"
+    "• /cancel_online — abort an online-purchase entry\n"
+    "• /reset — delete all your receipts\n"
+    "• /help — full guide with tips\n\n"
+
     "Need help? Contact <b>{support}</b>."
 )
 
