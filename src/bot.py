@@ -1234,54 +1234,6 @@ async def _save_online_purchase(
     )
 
 
-async def _handle_random_soliq_url(
-    update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str
-) -> None:
-    """Inquiry-only handler when a user pastes a soliq.uz URL with no
-    pending receipt. Tells them whether the receipt is already on file
-    and, if not, points them at the right next step."""
-    uid = update.effective_user.id
-    status = await update.message.reply_text("Checking soliq.uz...")
-
-    data, diag = await soliq.fetch_receipt_with_diag(text)
-    if not data:
-        await status.edit_text(
-            "I could not fetch data from soliq.uz for that URL.\n\n"
-            f"Reason: {diag}"
-        )
-        return
-
-    receipt_no = data.get("receipt_number", "")
-    existing = await db.find_receipt_by_number(uid, receipt_no)
-    if existing:
-        when = existing.get("created_at")
-        when_str = when.strftime("%Y-%m-%d") if hasattr(when, "strftime") else "?"
-        await status.edit_text(
-            f"This receipt is already in your records.\n\n"
-            f"Vendor: {existing.get('display_vendor', '-') or '-'}\n"
-            f"Date: {existing.get('date', '-') or '-'}\n"
-            f"Receipt #: {receipt_no or '-'}\n"
-            f"VAT: {float(existing.get('vat_amount') or 0):,.2f} UZS\n"
-            f"Saved on: {when_str}"
-        )
-        return
-
-    vendor = data.get("vendor", "") or "-"
-    await status.edit_text(
-        "I have the tax data for this receipt — but it's not saved yet.\n\n"
-        f"Vendor: {vendor}\n"
-        f"Date: {data.get('date', '-') or '-'}\n"
-        f"Receipt #: {receipt_no or '-'}\n"
-        f"VAT: {float(data.get('vat_amount') or 0):,.2f} UZS\n\n"
-        "To save it:\n"
-        "• Send a <b>photo</b> of the physical receipt to add it the normal way.\n"
-        "• If this was an <b>online purchase</b> (no physical receipt), run "
-        "/online_purchase and paste the link again — I'll save it with a "
-        "verified snapshot.",
-        parse_mode="HTML",
-    )
-
-
 async def _handle_manual_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     step = ctx.user_data.get("manual_step")
     data = ctx.user_data.setdefault("manual_data", {})
@@ -1658,11 +1610,14 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     pending = await db.get_pending_receipt(uid)
 
-    # Random soliq.uz URL paste with no pending photo: treat as an inquiry.
-    # Check if the receipt is already saved; if not, prompt the user to
-    # either send a photo or run /online_purchase.
+    # Soliq.uz URL paste with no pending photo: just save it as an online
+    # purchase. Whether the user ran /online_purchase first or pasted the
+    # link directly, the intent is the same — they want this URL turned
+    # into a saved receipt and they have no photo to attach. The save
+    # function already handles "already saved" / "0 VAT" / fetch-failure
+    # branches, so this is a single unified path.
     if not pending and _looks_like_soliq_url(text):
-        await _handle_random_soliq_url(update, ctx, text)
+        await _save_online_purchase(update, ctx, text)
         return
 
     if not pending:
