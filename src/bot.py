@@ -257,13 +257,13 @@ async def _save_verified_receipt(
 
     count = await db.count_receipts(uid)
     return (
-        f"Receipt added (#{count})\n\n"
+        f"✅ Saved! That's receipt #{count} for you.\n\n"
         f"Vendor: {display_vendor or '-'}\n"
         f"Date: {data.get('date', '-')}\n"
         f"Receipt #: {data.get('receipt_number', '-')}\n"
         f"Total: {data.get('total_amount', 0):,.2f} UZS\n"
-        f"VAT: {data.get('vat_amount', 0):,.2f} UZS\n"
-        "Verified tax data source: soliq.uz",
+        f"VAT: {data.get('vat_amount', 0):,.2f} UZS\n\n"
+        "Verified by soliq.uz",
         True,
     )
 
@@ -421,24 +421,16 @@ async def access_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 # ---------- Commands ----------
 
 _WELCOME_HTML = (
-    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.6.0</b>\n"
-    "Hi <b>{first_name}</b>! Send receipts as <b>files</b> (paperclip → File) "
-    "for best QR results. I'll read the QR, fetch VAT from soliq.uz, and store it. "
-    "If the QR is damaged or unreadable, use <b>/manual</b> to type the receipt in. "
-    "For online purchases (no physical receipt), use <b>/online_purchase</b> with the soliq.uz URL.\n\n"
-    "<b>Commands</b>\n"
-    "/setname — your name for exports\n"
-    "/manual — add a receipt manually (QR unreadable)\n"
-    "/online_purchase — add an online-purchase receipt from a soliq.uz URL\n"
-    "/list — show stored receipts\n"
-    "/export_vat — download VAT_Refund.xlsx\n"
-    "/export_pdf — download receipts PDF\n"
-    "/cancel_pending — discard a pending receipt\n"
-    "/cancel_manual — abort a manual entry\n"
-    "/cancel_online — abort an online-purchase entry\n"
-    "/reset — delete everything\n\n"
-    "Need help? Contact <b>{support}</b>.\n"
-    "⚖️ <i>MIT License — free to use, modify, and share.</i>"
+    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.7.0</b>\n\n"
+    "Hi <b>{first_name}</b>! 👋\n\n"
+    "<b>To add a receipt:</b> just send me a photo. That's it — "
+    "I do the rest.\n\n"
+    "<b>When you're ready to file:</b>\n"
+    "• /export_vat — official Excel form\n"
+    "• /export_pdf — receipt images package\n\n"
+    "<b>First time?</b> Run /setname so the forms have your name on them.\n\n"
+    "Tap <b>/</b> in the message box to see every command.\n\n"
+    "Need help? Contact <b>{support}</b>."
 )
 
 
@@ -534,7 +526,7 @@ async def cmd_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("No receipts yet. Send me a photo to add one!")
         return
 
-    lines = [f"You have {len(receipts)} receipt(s):\n"]
+    lines = [f"📋 You have {len(receipts)} receipt(s):\n"]
     total_vat = 0.0
     for i, r in enumerate(receipts, 1):
         vat = float(r.get("vat_amount") or 0)
@@ -823,7 +815,7 @@ async def _build_heartcheck_report() -> str:
     proxy_note = " (proxy)" if config.SOLIQ_PROXY else ""
 
     return (
-        "<b>🔧 Heartcheck — V.6.0</b>\n\n"
+        "<b>🔧 Heartcheck — V.7.0</b>\n\n"
         f"Status: ✅ alive\n"
         f"Uptime: {uptime_str}\n"
         f"PID: {pid}\n"
@@ -1130,13 +1122,13 @@ async def _save_online_purchase(
 
     count = await db.count_receipts(uid)
     await status.edit_text(
-        f"Online purchase added (#{count})\n\n"
+        f"✅ Online purchase saved! That's receipt #{count} for you.\n\n"
         f"Vendor: {data.get('vendor', '-') or '-'}\n"
         f"Date: {data.get('date', '-')}\n"
         f"Receipt #: {receipt_no or '-'}\n"
         f"Total: {data.get('total_amount', 0):,.2f} UZS\n"
-        f"VAT: {data.get('vat_amount', 0):,.2f} UZS\n"
-        "Verified tax data source: soliq.uz"
+        f"VAT: {data.get('vat_amount', 0):,.2f} UZS\n\n"
+        "Verified by soliq.uz"
     )
 
 
@@ -1282,14 +1274,15 @@ async def _handle_manual_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE, te
             if attached_image_id else ""
         )
         await update.message.reply_text(
-            f"Manual receipt added (#{count}) — flagged for finance review.\n\n"
+            f"✅ Manual receipt saved! That's receipt #{count} for you.\n\n"
             f"Date: {data['date']}\n"
             f"Vendor: {data['vendor']}\n"
             f"Receipt #: {data['receipt_number']}\n"
             f"VAT: {data['vat_amount']:,.2f} UZS"
             f"{attach_note}\n\n"
-            "The row number is shown in BOLD in the VAT_Refund.xlsx so the finance "
-            "office can review manual entries."
+            "<i>Manual entries are bolded in the Excel form so finance "
+            "can double-check them.</i>",
+            parse_mode="HTML",
         )
 
 
