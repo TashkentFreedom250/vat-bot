@@ -121,23 +121,31 @@ def _display_vendor(doc: dict) -> str:
 
 
 def _qr_failure_message(*, retry: bool) -> str:
-    """User-facing message when we couldn't decode a QR. `retry` = the user
-    already sent a close-up and it still didn't work."""
+    """User-facing message when we couldn't decode a QR. `retry` = a previous
+    photo for this same receipt also failed.
+
+    Important: we deliberately do NOT suggest "send a closer photo" here,
+    even though that used to be option 1. The previous flow tried to merge
+    a new photo's decoded QR into the previously-saved pending image, which
+    silently corrupted the image-to-data mapping when users actually sent a
+    different receipt by mistake. Recovery paths are now text-only and
+    unambiguous: paste the URL, /manual, or /cancel_pending.
+    """
     lead = (
-        "Sorry, I still couldn't read the QR code."
+        "Sorry, I still couldn't read the QR code on this receipt."
         if retry
         else "Sorry, I couldn't read the QR code from this receipt."
     )
     return (
         f"{lead}\n\n"
-        "You have three options:\n\n"
-        "1) Send a clearer close-up photo of just the QR code.\n\n"
-        "2) Paste the soliq.uz link — open your phone's camera, point it at "
-        "the QR, long-press the yellow banner → Share → pick this chat.\n\n"
-        "3) /manual — type the receipt in by hand (date, vendor, receipt #, "
-        "VAT). The photo you just sent will stay attached. Use "
+        "Two ways to finish this entry:\n\n"
+        "1) Paste the soliq.uz link as a message — open your phone's "
+        "camera, point it at the QR, long-press the yellow banner → "
+        "Share → pick this chat.\n\n"
+        "2) /manual — type the receipt in by hand (date, vendor, "
+        "receipt #, VAT). The photo you sent stays attached. Use "
         "/cancel_manual at any time to abort.\n\n"
-        "Or /cancel_pending to discard this receipt entirely.\n\n"
+        "Or /cancel_pending to discard this receipt and start fresh.\n\n"
         f"Need help? Contact {config.SUPPORT_CONTACT}."
     )
 
@@ -1357,42 +1365,13 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     qr_url = await _decode_qr(loop, image_bytes, cropped_bytes)
 
-    if pending:
-        if not qr_url:
-            await status.edit_text(_qr_failure_message(retry=True))
-            return
-
-        pending_image_id = pending.get("image_file_id")
-        if not pending_image_id:
-            await db.delete_pending_receipt(uid)
-            await status.edit_text(
-                "The pending receipt expired. Please send the full receipt again."
-            )
-            return
-
-        try:
-            pending_image_bytes = await db.get_image(pending_image_id)
-        except Exception:
-            logger.exception("Failed to load pending receipt image")
-            await db.delete_pending_receipt(uid)
-            await status.edit_text(
-                "I lost the earlier receipt image. Please send the full receipt again."
-            )
-            return
-
-        await status.edit_text("QR found. Finishing your previous receipt...")
-        message, saved = await _save_verified_receipt(
-            uid=uid,
-            source_image_bytes=pending_image_bytes,
-            qr_url=qr_url,
-            loop=loop,
-            qr_image_bytes=cropped_bytes,
-        )
-        await db.delete_pending_receipt(uid)
-        if saved:
-            message += "\n\nI used your QR close-up to verify the earlier receipt image."
-        await status.edit_text(message)
-        return
+    # Each photo is treated as its own receipt attempt. We never merge a
+    # new photo's decoded QR with the pending receipt's image — that path
+    # used to silently corrupt entries when users sent a different receipt
+    # mid-recovery. The pending receipt can only be finished via:
+    #   - pasting the soliq.uz URL as text (unambiguous, image stays put)
+    #   - /manual (the user types in the data, image stays attached)
+    #   - /cancel_pending (give up and start over)
 
     if not qr_url:
         try:
@@ -1420,20 +1399,39 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # Save the ORIGINAL uncropped bytes. If auto-crop failed badly the
         # cropped image may have clipped the QR or distorted the receipt —
         # keeping the full-quality original preserves every pixel the user
-        # captured for later review or export.
+        # captured for later review or export. save_pending_receipt deletes
+        # any prior pending image first, so the user's previous unscanned
+        # photo (if any) gets replaced by this new one.
         await db.save_pending_receipt(uid, image_bytes, file_name)
-        await status.edit_text(_qr_failure_message(retry=False))
+        msg_text = _qr_failure_message(retry=bool(pending))
+        if pending:
+            msg_text = (
+                "Replaced your previous unscanned attempt with this new photo. "
+                "If those were two different receipts, the previous one is gone — "
+                "please send it again later.\n\n"
+            ) + msg_text
+        await status.edit_text(msg_text)
         return
 
     await status.edit_text("QR found. Fetching verified data from soliq.uz...")
     # Save the ORIGINAL bytes (not the crop) so the stored receipt always
     # has maximum detail. The crop is only a processing step for QR decode.
-    message, _ = await _save_verified_receipt(
+    message, saved = await _save_verified_receipt(
         uid=uid,
         source_image_bytes=image_bytes,
         qr_url=qr_url,
         loop=loop,
     )
+    # If a pending receipt is still waiting (the user fired off another
+    # photo before finishing the previous one), the pending row is left
+    # alone — its image stays attached to whatever the user later supplies
+    # via URL paste or /manual. We just remind them it's still there.
+    if saved and pending:
+        message += (
+            "\n\nYour earlier unfinished receipt is still waiting. To "
+            "finish it, paste its soliq.uz link, or run /manual. Use "
+            "/cancel_pending to discard it."
+        )
     await status.edit_text(message)
 
 
