@@ -153,6 +153,111 @@ def classify_document(image_bytes: bytes) -> dict:
     return _classify_lines(lines, image_height=img.shape[0])
 
 
+# OCR fallback for the QR URL. When zxing/pyzbar can't decode the QR
+# (very long receipts where the QR ends up tiny in the frame, motion
+# blur, glare on the QR square), the URL is usually still printed in
+# plain text right next to the QR — readable by OCR. We extract every
+# URL-shaped substring that looks like a soliq.uz link, normalize
+# common OCR character confusions, and let the caller validate each by
+# trying to fetch from soliq. Validation is the source of truth — if
+# soliq returns valid data, the URL was right; if not, we move on.
+_SOLIQ_HOST_VARIANTS = re.compile(
+    r"so[l1!\|i][il1!\|][gqo]\.?uz", re.IGNORECASE
+)
+_URL_FRAGMENT_RE = re.compile(
+    r"https?[:;]?[/\\]{0,3}[^\s ]+",
+    re.IGNORECASE,
+)
+_OCR_CHAR_FIXES = (
+    # Hostname / scheme noise. Order matters — apply more specific first.
+    ("ofd.so1iq.uz", "ofd.soliq.uz"),
+    ("ofd.solig.uz", "ofd.soliq.uz"),
+    ("ofd.solrq.uz", "ofd.soliq.uz"),
+    ("ofd.so|iq.uz", "ofd.soliq.uz"),
+    ("0fd.soliq.uz", "ofd.soliq.uz"),
+    ("Ofd.soliq.uz", "ofd.soliq.uz"),
+)
+# Inside the query string the values are alphanumeric. We don't blindly
+# substitute O->0 etc. across the whole URL because the terminal id
+# legitimately mixes letters and digits; instead we yield a few
+# candidate URLs with targeted swaps and let soliq validate.
+
+
+def extract_soliq_url_candidates(image_bytes: bytes, max_candidates: int = 6) -> list[str]:
+    """Run OCR on the image and return up to `max_candidates` URL strings
+    that look like soliq.uz receipt links. Caller validates each by
+    actually fetching it (the only ground truth is what soliq returns).
+    Empty list if OCR finds nothing usable."""
+    try:
+        img = _downscale_for_ocr(_to_cv(image_bytes))
+    except Exception:
+        logger.exception("OCR-fallback: image decode failed")
+        return []
+    if img.size == 0:
+        return []
+    lines = _ocr_lines(img)
+    if not lines:
+        return []
+
+    # Concatenate all OCR text (some receipts split the URL across lines —
+    # we glue them back together with a single separator, then look for
+    # url-like fragments anywhere in the blob).
+    text_blob = " ".join((line.get("text") or "").strip() for line in lines)
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    for raw in _URL_FRAGMENT_RE.findall(text_blob):
+        cleaned = _clean_url_fragment(raw)
+        if not cleaned:
+            continue
+        if "soliq" not in cleaned.lower() and not _SOLIQ_HOST_VARIANTS.search(cleaned):
+            continue
+        for variant in _url_variants(cleaned):
+            if variant in seen:
+                continue
+            seen.add(variant)
+            candidates.append(variant)
+            if len(candidates) >= max_candidates:
+                return candidates
+    return candidates
+
+
+def _clean_url_fragment(raw: str) -> str:
+    """Tidy up an OCR'd URL fragment: trim trailing punctuation, fix
+    obvious scheme/host noise, drop control characters."""
+    s = raw.strip().rstrip(".,;:)\"']")
+    # OCR sometimes reads "://" as ":/" or ";//".
+    s = s.replace("https;", "https:").replace("http;", "http:")
+    s = re.sub(r"^https?[:;]?[/\\]{0,3}", "https://", s, count=1, flags=re.IGNORECASE)
+    for bad, good in _OCR_CHAR_FIXES:
+        s = s.replace(bad, good)
+    # Drop anything that's not URL-safe at the tail
+    s = re.sub(r"[ \s].*$", "", s)
+    return s
+
+
+def _url_variants(url: str) -> list[str]:
+    """Yield a small set of likely URLs given OCR ambiguity. We only
+    swap chars in the query string, not the hostname (which we already
+    fixed via _OCR_CHAR_FIXES)."""
+    variants = [url]
+    # Common OCR confusions that affect query values: O<->0, l/I/|<->1.
+    # Apply them only to the part after the host.
+    if "://" in url and "soliq.uz" in url.lower():
+        try:
+            scheme_host, rest = url.split("soliq.uz", 1)
+            base = scheme_host + "soliq.uz"
+            swapped_O = base + rest.replace("O", "0")
+            swapped_l = base + rest.replace("l", "1").replace("I", "1").replace("|", "1")
+            for v in (swapped_O, swapped_l):
+                if v not in variants:
+                    variants.append(v)
+        except Exception:
+            pass
+    return variants
+
+
 def _get_engine():
     global _ENGINE
     if _ENGINE is not None:

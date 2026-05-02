@@ -138,14 +138,15 @@ def _qr_failure_message(*, retry: bool) -> str:
     )
     return (
         f"{lead}\n\n"
-        "Two ways to finish this entry:\n\n"
-        "1) Paste the soliq.uz link as a message — open your phone's "
-        "camera, point it at the QR, long-press the yellow banner → "
-        "Share → pick this chat.\n\n"
-        "2) /manual — type the receipt in by hand (date, vendor, "
-        "receipt #, VAT). The photo you sent stays attached. Use "
-        "/cancel_manual at any time to abort.\n\n"
-        "Or /cancel_pending to discard this receipt and start fresh.\n\n"
+        "👉 <b>Best way to finish this entry:</b> paste the soliq.uz "
+        "link.\n\n"
+        "How: open your phone's camera, point it at the QR, "
+        "long-press the yellow banner → Share → pick this chat. "
+        "I'll fetch verified data from soliq.uz and finish the entry "
+        "with the photo you already sent.\n\n"
+        "<i>Last resort:</i> /manual to type it in by hand (only if "
+        "you really can't get the link). Or /cancel_pending to discard "
+        "and start fresh.\n\n"
         f"Need help? Contact {config.SUPPORT_CONTACT}."
     )
 
@@ -1424,6 +1425,33 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     qr_url = await _decode_qr(loop, image_bytes, cropped_bytes)
 
+    # OCR fallback: long receipts often have the QR too small for zxing
+    # to lock onto, but the URL is printed in plain text right next to
+    # the QR and OCR can usually read it. We try each candidate against
+    # soliq.uz — the first one that returns valid data wins. If none
+    # validate, we fall through to the existing pending-receipt flow,
+    # so worst case behavior is identical to before.
+    ocr_recovered = False
+    if not qr_url:
+        try:
+            candidates = await loop.run_in_executor(
+                None, receipt_ocr.extract_soliq_url_candidates, image_bytes
+            )
+        except Exception:
+            logger.exception("OCR fallback: candidate extraction failed")
+            candidates = []
+        for candidate in candidates:
+            try:
+                test_data = await soliq.fetch_receipt_data(candidate)
+            except Exception:
+                logger.exception("OCR fallback: soliq fetch crashed for %s", candidate)
+                test_data = None
+            if test_data and test_data.get("vat_amount"):
+                qr_url = candidate
+                ocr_recovered = True
+                logger.info("OCR fallback recovered URL: %s", candidate)
+                break
+
     # Each photo is treated as its own receipt attempt. We never merge a
     # new photo's decoded QR with the pending receipt's image — that path
     # used to silently corrupt entries when users sent a different receipt
@@ -1469,10 +1497,16 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 "If those were two different receipts, the previous one is gone — "
                 "please send it again later.\n\n"
             ) + msg_text
-        await status.edit_text(msg_text)
+        await status.edit_text(msg_text, parse_mode="HTML")
         return
 
-    await status.edit_text("QR found. Fetching verified data from soliq.uz...")
+    if ocr_recovered:
+        await status.edit_text(
+            "QR was hard to read — recovered the link from the receipt's "
+            "printed text instead. Fetching verified data from soliq.uz..."
+        )
+    else:
+        await status.edit_text("QR found. Fetching verified data from soliq.uz...")
     # Save the ORIGINAL bytes (not the crop) so the stored receipt always
     # has maximum detail. The crop is only a processing step for QR decode.
     message, saved = await _save_verified_receipt(
