@@ -483,8 +483,74 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await _send_approval_request(ctx, user)
 
 
+_HELP_HTML = (
+    "<b>📖 Tashkent Embassy VAT Refund Bot — Quick Guide</b>\n\n"
+
+    "<b>What this bot does</b>\n"
+    "It collects your VAT receipts and turns them into the official "
+    "VAT refund forms when you're ready to file. You take a photo, "
+    "I read the QR code on the receipt and pull the verified VAT "
+    "amount straight from soliq.uz (the tax authority's database). "
+    "No typing, no math — and the numbers can't be wrong because "
+    "they come from the tax office itself.\n\n"
+
+    "<b>📸 Add a receipt — three ways</b>\n\n"
+
+    "<b>1. Take a photo (most common)</b>\n"
+    "Just send me a photo of the receipt. For best results, send it "
+    "as a <b>file</b> (paperclip → File) instead of a regular photo "
+    "— Telegram doesn't compress files, so the QR stays sharp. "
+    "Make sure the QR code is clearly visible and not blurry.\n\n"
+
+    "<b>2. Online purchase (no physical receipt)</b>\n"
+    "If you bought something online and the merchant emailed you a "
+    "soliq.uz receipt link, run /online_purchase and paste the link. "
+    "I'll fetch the data and save it with a clean snapshot — no photo "
+    "needed.\n\n"
+
+    "<b>3. Manual entry (QR unreadable)</b>\n"
+    "If the receipt's QR code is damaged or won't scan, run /manual. "
+    "I'll ask you for date, vendor, receipt number, and VAT amount in "
+    "four short steps.\n\n"
+
+    "<b>🔧 If a photo's QR fails</b>\n"
+    "Two ways to recover:\n"
+    "• Open your phone's camera, point at the QR, long-press the "
+    "yellow URL banner → Share → pick this chat. Paste it. I'll "
+    "complete the entry from your earlier photo.\n"
+    "• Run /manual and type the receipt in.\n"
+    "• Or /cancel_pending to discard it and start over.\n\n"
+
+    "<b>📋 Review what's saved</b>\n"
+    "/list — see every receipt you've added, with the running total.\n\n"
+
+    "<b>📥 File your refund</b>\n"
+    "When you're ready:\n"
+    "• /export_vat — the official VAT_Refund.xlsx, already filled in. "
+    "If your receipts span multiple years, you'll get one workbook "
+    "per year. If a single year has more than 120 receipts, it'll "
+    "be split into copy 1, copy 2, etc., with continuous numbering.\n"
+    "• /export_pdf — a PDF with every receipt image and a summary "
+    "table. Hand both files to the finance office.\n\n"
+
+    "<b>⚙️ Other commands</b>\n"
+    "/setname — set your name (used in exports)\n"
+    "/cancel_manual — abort a manual entry\n"
+    "/cancel_online — abort an online purchase entry\n"
+    "/cancel_pending — discard a pending receipt\n"
+    "/reset — delete all your receipts (asks for confirmation)\n"
+    "/whoami — show your Telegram ID\n\n"
+
+    "Need help? Contact <b>{support}</b>."
+)
+
+
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    await cmd_start(update, ctx)
+    await update.message.reply_text(
+        _HELP_HTML.format(support=escape(config.SUPPORT_CONTACT)),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 async def cmd_whoami(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
