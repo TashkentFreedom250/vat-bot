@@ -17,6 +17,50 @@ register_heif_opener()
 _QR_DETECTOR = cv2.QRCodeDetector()
 
 
+# ---------- Image similarity (for "is this the same receipt?" detection) ----------
+
+# Average-hash size: 16x16 grayscale → 256-bit fingerprint. Plenty of
+# resolution to distinguish two different receipts while still tolerating
+# crop/lighting/angle changes when the user retakes the same one.
+_AHASH_SIZE = 16
+# Hamming-distance threshold for "same receipt": below this, treat as the
+# same image (lighting/angle differences). Above this, different receipts.
+# 30 / 256 = ~12% differing bits — generous enough for re-takes, tight
+# enough that two different receipts almost never match.
+_AHASH_SIMILAR_THRESHOLD = 30
+
+
+def perceptual_hash(image_bytes: bytes) -> Optional[int]:
+    """Compute a 256-bit average-hash for `image_bytes`. Returns None if
+    the image can't be decoded (caller falls back to "keep pending")."""
+    try:
+        pil = Image.open(BytesIO(image_bytes)).convert("L")
+        pil = pil.resize((_AHASH_SIZE, _AHASH_SIZE), Image.LANCZOS)
+    except Exception:
+        return None
+    pixels = list(pil.getdata())
+    if not pixels:
+        return None
+    avg = sum(pixels) / len(pixels)
+    bits = 0
+    for i, p in enumerate(pixels):
+        if p > avg:
+            bits |= 1 << i
+    return bits
+
+
+def images_likely_same(bytes_a: bytes, bytes_b: bytes) -> bool:
+    """Best-effort: returns True only when the two images are clearly
+    similar enough to be the same receipt photographed twice. Conservative
+    by design — when in doubt we return False so the pending receipt is
+    preserved."""
+    h1 = perceptual_hash(bytes_a)
+    h2 = perceptual_hash(bytes_b)
+    if h1 is None or h2 is None:
+        return False
+    return (h1 ^ h2).bit_count() <= _AHASH_SIMILAR_THRESHOLD
+
+
 def _to_cv(image_bytes: bytes) -> np.ndarray:
     """Load bytes into an OpenCV BGR image. Falls back to PIL for HEIC/HEIF."""
     arr = np.frombuffer(image_bytes, dtype=np.uint8)

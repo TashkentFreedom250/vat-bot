@@ -1515,17 +1515,58 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         qr_url=qr_url,
         loop=loop,
     )
-    # If a pending receipt is still waiting (the user fired off another
-    # photo before finishing the previous one), the pending row is left
-    # alone — its image stays attached to whatever the user later supplies
-    # via URL paste or /manual. We just remind them it's still there.
+    # If a pending receipt was waiting and we just saved a receipt
+    # successfully, two scenarios are possible:
+    #   (a) the user retook the same receipt — the pending image is the
+    #       same scene as the new one, just blurrier or worse-angled.
+    #       In that case the pending is now stale: we silently clean it
+    #       up so we don't nag the user about a "still waiting" entry
+    #       they just resolved.
+    #   (b) the user moved on to a different receipt — the pending image
+    #       is a genuinely different unfinished entry. Keep it.
+    # We disambiguate via a 16x16 average-hash comparison of the two
+    # images. The check is conservative (only flags clearly-similar
+    # images), so the worst case is the old reminder still appearing
+    # when it doesn't need to — never the reverse.
     if saved and pending:
-        message += (
-            "\n\nYour earlier unfinished receipt is still waiting. To "
-            "finish it, paste its soliq.uz link, or run /manual. Use "
-            "/cancel_pending to discard it."
-        )
+        pending_was_retake = await _pending_is_same_receipt(pending, image_bytes, loop)
+        if pending_was_retake:
+            try:
+                await db.delete_pending_receipt(uid)
+            except Exception:
+                logger.exception("Failed to clean up stale pending after retake")
+        else:
+            message += (
+                "\n\nYour earlier unfinished receipt is still waiting. To "
+                "finish it, paste its soliq.uz link, or run /manual. Use "
+                "/cancel_pending to discard it."
+            )
     await status.edit_text(message)
+
+
+async def _pending_is_same_receipt(
+    pending: dict,
+    new_image_bytes: bytes,
+    loop: asyncio.AbstractEventLoop,
+) -> bool:
+    """Heuristic: is the new photo a re-take of the pending receipt?
+    Best-effort image-hash compare; returns False on any failure so the
+    pending receipt is preserved."""
+    pending_image_id = pending.get("image_file_id")
+    if not pending_image_id:
+        return False
+    try:
+        pending_bytes = await db.get_image(pending_image_id)
+    except Exception:
+        logger.exception("Could not load pending image for retake check")
+        return False
+    try:
+        return await loop.run_in_executor(
+            None, receipt_image.images_likely_same, pending_bytes, new_image_bytes
+        )
+    except Exception:
+        logger.exception("Image-hash compare failed")
+        return False
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
