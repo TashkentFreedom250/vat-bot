@@ -1516,19 +1516,22 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         loop=loop,
     )
     # Any successful save silently clears the pending receipt — most of the
-    # time it's the user retaking the same receipt (the case the previous
-    # image-hash heuristic was meant to catch but couldn't reliably detect
-    # under real-world lighting/framing changes), and even when it isn't,
-    # the reminder text we used to show was ignored anyway. Trade-off: a
-    # user who had a genuinely different failed receipt pending then saves
-    # an unrelated one loses the failed one's photo. Recoverable — they
-    # just retake it. Pending state is low-value (image only, no data),
-    # so the loss is small and the reduced nagging is worth it.
+    # time it's the user retaking the same receipt (image-hash detection
+    # turned out to be unreliable on real phone photos). Trade-off: a user
+    # who had a genuinely different failed receipt pending then saves an
+    # unrelated one loses the failed one's photo. We append a short, plain
+    # note so they at least know the old pending is gone — short enough
+    # that the retake case can ignore it without feeling nagged.
     if saved and pending:
         try:
             await db.delete_pending_receipt(uid)
         except Exception:
             logger.exception("Failed to clean up pending after successful save")
+        message += (
+            "\n\n(Note: a previous unscanned receipt was dropped. "
+            "If it was a different receipt, retake it or paste its "
+            "soliq.uz QR link.)"
+        )
     await status.edit_text(message)
 
 
