@@ -183,6 +183,57 @@ def _format_ocr_preview(preview: dict, intro: str = "I couldn't verify the QR co
     return "\n".join(lines)
 
 
+async def _safe_telegram_call(coro_factory, what: str = "Telegram call"):
+    """Run a Telegram coroutine and never let a transient error propagate.
+
+    Used so cosmetic UI calls (status messages, typing pings) can't abort
+    the actual receipt save when Telegram is rate-limiting us. Tries
+    once, sleeps + retries on RetryAfter (capped), and swallows
+    NetworkError / TimedOut. Returns the call's return value on success
+    or None on any failure. The caller is responsible for treating None
+    as "no message handle" (e.g. skipping subsequent edits)."""
+    from telegram.error import NetworkError, RetryAfter, TimedOut
+    try:
+        return await coro_factory()
+    except RetryAfter as e:
+        wait = min(getattr(e, "retry_after", 5), 15)
+        logger.warning("RetryAfter on %s (waiting %ss): %s", what, wait, e)
+        try:
+            await asyncio.sleep(wait + 0.5)
+            return await coro_factory()
+        except Exception:
+            logger.warning(
+                "%s still failed after RetryAfter retry — receipt save "
+                "still proceeded.", what, exc_info=True,
+            )
+            return None
+    except (NetworkError, TimedOut) as e:
+        logger.warning("Transient %s error: %s", what, e)
+        return None
+    except Exception:
+        logger.warning("%s failed (non-fatal)", what, exc_info=True)
+        return None
+
+
+async def _safe_reply(msg, text: str, **kwargs):
+    """msg.reply_text with retry-on-RetryAfter; returns the new Message or
+    None. None means subsequent edits should be skipped — the receipt
+    save still goes through."""
+    return await _safe_telegram_call(
+        lambda: msg.reply_text(text, **kwargs), "reply_text"
+    )
+
+
+async def _safe_edit(status_msg, text: str, **kwargs) -> None:
+    """Edit a status message. No-op if status_msg is None (which happens
+    when the initial reply failed under flood control). Never raises."""
+    if status_msg is None:
+        return
+    await _safe_telegram_call(
+        lambda: status_msg.edit_text(text, **kwargs), "status edit"
+    )
+
+
 async def _keep_typing(bot, chat_id: int, interval: float = 4.0) -> None:
     """Keep Telegram's "is typing..." indicator alive while a slow
     operation runs. Telegram drops the chat action after ~5 seconds, so
@@ -1167,11 +1218,11 @@ async def _save_online_purchase(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, qr_url: str
 ) -> None:
     uid = update.effective_user.id
-    status = await update.message.reply_text("Fetching verified data from soliq.uz...")
+    status = await _safe_reply(update.message, "Fetching verified data from soliq.uz...")
 
     data, diag = await soliq.fetch_receipt_with_diag(qr_url)
     if not data:
-        await status.edit_text(
+        await _safe_edit(status,
             "I could not fetch data from soliq.uz for that URL.\n\n"
             f"Reason: {diag}\n\n"
             f"Need help? Contact {config.SUPPORT_CONTACT}."
@@ -1180,7 +1231,7 @@ async def _save_online_purchase(
 
     if not data.get("vat_amount"):
         vendor = data.get("vendor", "") or data.get("receipt_number", "this receipt")
-        await status.edit_text(
+        await _safe_edit(status,
             f"This receipt ({vendor}) has 0 VAT — nothing to refund.\n"
             "It will not be added to your records."
         )
@@ -1189,7 +1240,7 @@ async def _save_online_purchase(
     receipt_no = data.get("receipt_number", "")
     existing = await db.find_receipt_by_number(uid, receipt_no)
     if existing:
-        await status.edit_text(
+        await _safe_edit(status,
             f"This receipt (#{receipt_no}) is already in your records — "
             f"saved on {existing.get('created_at', '?')}."
         )
@@ -1224,13 +1275,13 @@ async def _save_online_purchase(
     }
     inserted = await db.save_receipt(receipt_doc)
     if inserted is None:
-        await status.edit_text(
+        await _safe_edit(status,
             f"This receipt (#{receipt_no}) is already in your records."
         )
         return
 
     count = await db.count_receipts(uid)
-    await status.edit_text(
+    await _safe_edit(status,
         f"✅ Online purchase saved! That's receipt #{count} for you.\n\n"
         f"Vendor: {data.get('vendor', '-') or '-'}\n"
         f"Date: {data.get('date', '-')}\n"
@@ -1370,16 +1421,16 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         return
 
-    # send_chat_action is purely cosmetic (the typing indicator). When
-    # Telegram is rate-limiting us during a photo burst it raises
-    # RetryAfter — must never block actual photo processing. Same for
-    # any transient network blip; we'd rather lose the typing dots than
-    # drop the user's receipt on the floor.
-    try:
-        await ctx.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
-    except Exception:
-        logger.debug("Initial typing ping failed (non-fatal)", exc_info=True)
-    status = await msg.reply_text("Got it, processing...")
+    # Cosmetic typing ping + initial status message — both wrapped so a
+    # flood-control RetryAfter or transient network error during a busy
+    # burst can't abort photo processing. The receipt save runs even if
+    # both fail; status will just be None and downstream edits will
+    # silently no-op.
+    await _safe_telegram_call(
+        lambda: ctx.bot.send_chat_action(msg.chat_id, ChatAction.TYPING),
+        "send_chat_action",
+    )
+    status = await _safe_reply(msg, "Got it, processing...")
 
     # Keep the "is typing..." indicator alive for the full duration of
     # processing — long receipts can spend 5-15 seconds in OCR fallback
@@ -1415,7 +1466,7 @@ async def _process_photo(
         image_bytes = bytes(await tg_file.download_as_bytearray())
     except Exception as e:
         logger.exception("Download failed")
-        await status.edit_text(f"Could not download the image: {e}")
+        await _safe_edit(status, f"Could not download the image: {e}")
         return
 
     debug_dir = None
@@ -1470,7 +1521,7 @@ async def _process_photo(
         # indicator is alive too, but a concrete message reassures users
         # who have learned to ignore the typing dots.
         try:
-            await status.edit_text("QR is small — scanning the receipt text...")
+            await _safe_edit(status, "QR is small — scanning the receipt text...")
         except Exception:
             pass
         try:
@@ -1511,7 +1562,7 @@ async def _process_photo(
 
         if classification.get("kind") == "payment_slip":
             vendor = classification.get("vendor") or "this merchant"
-            await status.edit_text(
+            await _safe_edit(status,
                 "This looks like a bank card payment slip, not a fiscal VAT receipt.\n\n"
                 f"Merchant: {vendor}\n"
                 "Please send the fiscal receipt from the merchant with the tax QR code."
@@ -1537,16 +1588,16 @@ async def _process_photo(
                 "If those were two different receipts, the previous one is gone — "
                 "please send it again later.\n\n"
             ) + msg_text
-        await status.edit_text(msg_text, parse_mode="HTML")
+        await _safe_edit(status, msg_text, parse_mode="HTML")
         return
 
     if ocr_recovered:
-        await status.edit_text(
+        await _safe_edit(status,
             "QR was hard to read — recovered the link from the receipt's "
             "printed text instead. Fetching verified data from soliq.uz..."
         )
     else:
-        await status.edit_text("QR found. Fetching verified data from soliq.uz...")
+        await _safe_edit(status, "QR found. Fetching verified data from soliq.uz...")
     # Save the ORIGINAL bytes (not the crop) so the stored receipt always
     # has maximum detail. The crop is only a processing step for QR decode.
     message, saved = await _save_verified_receipt(
@@ -1572,7 +1623,7 @@ async def _process_photo(
             "If it was a different receipt, retake it or paste its "
             "soliq.uz QR link.)"
         )
-    await status.edit_text(message)
+    await _safe_edit(status, message)
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1658,13 +1709,13 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    status = await update.message.reply_text("Link received. Fetching verified data from soliq.uz...")
+    status = await _safe_reply(update.message, "Link received. Fetching verified data from soliq.uz...")
     try:
         pending_image_bytes = await db.get_image(pending_image_id)
     except Exception:
         logger.exception("Failed to load pending receipt image")
         await db.delete_pending_receipt(uid)
-        await status.edit_text(
+        await _safe_edit(status,
             "I lost the earlier receipt image. Please send the full receipt again."
         )
         return
@@ -1679,7 +1730,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await db.delete_pending_receipt(uid)
     if saved:
         message += "\n\nReceipt completed using the link you pasted."
-    await status.edit_text(message)
+    await _safe_edit(status, message)
 
 
 # ---------- App setup ----------
