@@ -96,7 +96,7 @@ _executor = ThreadPoolExecutor(
 
 
 async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    from telegram.error import Conflict, NetworkError, TimedOut
+    from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
     err = ctx.error
     # Transient connectivity hiccups (DNS blips, Mac WiFi sleep, brief
     # api.telegram.org reachability gaps) are already retried internally by
@@ -112,6 +112,13 @@ async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # this is recovery noise, not an outage.
     if isinstance(err, Conflict):
         logger.warning("Polling conflict (duplicate instance, auto-resolved): %s", err)
+        return
+    # RetryAfter = Telegram per-bot flood control. Happens during photo
+    # bursts. PTB raises it on whatever Telegram call hit the limit; the
+    # call sites that matter (send_chat_action / typing keepalive) wrap
+    # in try/except so this is never user-facing — log as WARNING.
+    if isinstance(err, RetryAfter):
+        logger.warning("Telegram flood control: %s", err)
         return
     logger.error("Unhandled exception while processing an update.", exc_info=err)
 
@@ -1363,7 +1370,15 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         return
 
-    await ctx.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+    # send_chat_action is purely cosmetic (the typing indicator). When
+    # Telegram is rate-limiting us during a photo burst it raises
+    # RetryAfter — must never block actual photo processing. Same for
+    # any transient network blip; we'd rather lose the typing dots than
+    # drop the user's receipt on the floor.
+    try:
+        await ctx.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+    except Exception:
+        logger.debug("Initial typing ping failed (non-fatal)", exc_info=True)
     status = await msg.reply_text("Got it, processing...")
 
     # Keep the "is typing..." indicator alive for the full duration of
