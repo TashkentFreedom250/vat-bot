@@ -250,15 +250,14 @@ def _decode_with_opencv(img: np.ndarray) -> list[str]:
         except Exception:
             pass
 
-    # Curved-QR detection is only on the classic detector — the Aruco one
-    # doesn't expose it. Worth one attempt on the raw image: receipts
-    # photographed at extreme angles can warp the QR enough to look curved.
-    try:
-        data, _, _ = _QR_DETECTOR.detectAndDecodeCurved(img)
-        if data:
-            _append_unique(results, [data])
-    except Exception:
-        pass
+    # NOTE: cv2.QRCodeDetector.detectAndDecodeCurved() is intentionally
+    # NOT called. In OpenCV 4.10 it has a null-pointer deref inside
+    # cv::QRDecode::straightenQRCodeInParts that segfaults the whole
+    # Python process on certain phone close-ups — Python try/except
+    # can't catch a SIGSEGV in a C extension. We had a production
+    # crash on 2026-05-14 traced to this exact frame and pulled the
+    # call. zxing's curved/perspective handling + the Aruco detector
+    # cover the same cases without crashing.
     return results
 
 
