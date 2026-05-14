@@ -539,48 +539,33 @@ async def _write_pdf_chunk(
     c.drawString(margin + 100 * mm, y, "SUBTOTAL" if total_parts > 1 else "TOTAL")
     c.drawRightString(margin + 185 * mm, y, f"{chunk_total:,.2f}")
 
-    # --- Two receipts per page ---------------------------------------------
-    # Each receipt slot has the soliq.uz screenshot on the left and a
-    # scannable QR + a short identity block on the right. The QR encodes
-    # the soliq.uz URL so the tax office can verify any single receipt
-    # by scanning the PDF page directly. Old receipts saved before
-    # screenshots were captured fall back to a data render in the
-    # screenshot slot — the QR column still renders with the URL.
-    SLOTS_PER_PAGE = 2
+    # --- One receipt per page ---------------------------------------------
+    # We tried 2-per-page in V.11 but long receipts (50+ items) became
+    # too small to read once the screenshot was shrunk to half a page.
+    # One receipt per page gives each soliq.uz screenshot the full A4
+    # height; even a 30-item receipt stays legible. The slot layout is
+    # unchanged — screenshot on the left, scannable QR + identity block
+    # on the right — just bigger.
     footer_h = 8 * mm
-    usable_h = height - 2 * margin - footer_h
-    slot_h = usable_h / SLOTS_PER_PAGE
+    slot_h = height - 2 * margin - footer_h
     slot_w = width - 2 * margin
 
-    for page_start in range(0, len(chunk), SLOTS_PER_PAGE):
+    for slot_idx, r in enumerate(chunk):
         c.showPage()
-        page_receipts = chunk[page_start : page_start + SLOTS_PER_PAGE]
-        for slot_idx, r in enumerate(page_receipts):
-            global_i = global_offset + page_start + slot_idx + 1
-            # Top slot draws higher on the page than the bottom slot.
-            slot_y = margin + footer_h + (SLOTS_PER_PAGE - 1 - slot_idx) * slot_h
-            await _draw_receipt_slot(
-                c, r, global_i, total_receipts,
-                margin, slot_y, slot_w, slot_h,
-            )
-            # Thin divider between the two slots on the same page so the
-            # reader sees a clear boundary.
-            if slot_idx == 0 and len(page_receipts) > 1:
-                c.setStrokeColor(_RULE)
-                c.setLineWidth(0.5)
-                c.line(margin, slot_y, margin + slot_w, slot_y)
+        global_i = global_offset + slot_idx + 1
+        slot_y = margin + footer_h
+        await _draw_receipt_slot(
+            c, r, global_i, total_receipts,
+            margin, slot_y, slot_w, slot_h,
+        )
 
         # Page footer
         c.setFont("Helvetica", 8)
         c.setFillGray(0.5)
         c.drawString(margin, margin / 2, employee_name or "")
-        last_i = global_offset + min(
-            page_start + SLOTS_PER_PAGE, len(chunk)
-        )
-        first_i = global_offset + page_start + 1
         c.drawRightString(
             width - margin, margin / 2,
-            f"Receipts {first_i}–{last_i} of {total_receipts}",
+            f"Receipt {global_i} of {total_receipts}",
         )
         c.setFillGray(0)
 

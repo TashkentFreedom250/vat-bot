@@ -527,7 +527,7 @@ async def access_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 # ---------- Commands ----------
 
 _WELCOME_HTML = (
-    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.11.0</b>\n\n"
+    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.12.0</b>\n\n"
     "Hi <b>{first_name}</b>! 👋\n"
     "Just send me a 📸 photo of any receipt — I read the QR and save it.\n\n"
 
@@ -1000,7 +1000,7 @@ async def _build_heartcheck_report() -> str:
     proxy_note = " (proxy)" if config.SOLIQ_PROXY else ""
 
     return (
-        "<b>🔧 Heartcheck — V.11.0</b>\n\n"
+        "<b>🔧 Heartcheck — V.12.0</b>\n\n"
         f"Status: ✅ alive\n"
         f"Uptime: {uptime_str}\n"
         f"PID: {pid}\n"
