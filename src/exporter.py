@@ -283,10 +283,15 @@ def _esc(text) -> str:
 
 
 def _build_receipt_page_story(r: dict, global_i: int, total_receipts: int,
-                              frame_w: float) -> list:
+                              frame_w: float, *, include_title: bool = True) -> list:
     """Build the Platypus story for a single receipt's page. Returned
     flowables are wrapped in a KeepInFrame by the caller so the whole
-    block shrinks to fit one page when items spill over."""
+    block shrinks to fit one page when items spill over.
+
+    `include_title` controls the blue title bar at the top. The slot
+    renderer already draws its own header, so it passes False here to
+    avoid double headers on old receipts that fall back to this view.
+    """
     vendor = _display_vendor(r) or "—"
     date = r.get("date") or "—"
     receipt_no = r.get("receipt_number") or "—"
@@ -298,24 +303,24 @@ def _build_receipt_page_story(r: dict, global_i: int, total_receipts: int,
 
     story: list = []
 
-    # Title bar: blue band with the page index and a soliq.uz badge.
-    badge = "Verified by soliq.uz" if soliq_url else "Manual entry"
-    title_table = Table(
-        [[Paragraph(f"Receipt #{global_i} of {total_receipts}", _STYLE_TITLE),
-          Paragraph(badge, _STYLE_TITLE)]],
-        colWidths=[frame_w * 0.55, frame_w * 0.45],
-    )
-    title_table.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), _ACCENT),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 8),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-        ("ALIGN", (1, 0), (1, 0), "RIGHT"),
-    ]))
-    story.append(title_table)
-    story.append(Spacer(0, 6))
+    if include_title:
+        badge = "Verified by soliq.uz" if soliq_url else "Manual entry"
+        title_table = Table(
+            [[Paragraph(f"Receipt #{global_i} of {total_receipts}", _STYLE_TITLE),
+              Paragraph(badge, _STYLE_TITLE)]],
+            colWidths=[frame_w * 0.55, frame_w * 0.45],
+        )
+        title_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), _ACCENT),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+        ]))
+        story.append(title_table)
+        story.append(Spacer(0, 6))
 
     # Header block — two columns of label/value pairs so the page reads
     # like the soliq.uz page itself (vendor first, then receipt-level
@@ -534,73 +539,211 @@ async def _write_pdf_chunk(
     c.drawString(margin + 100 * mm, y, "SUBTOTAL" if total_parts > 1 else "TOTAL")
     c.drawRightString(margin + 185 * mm, y, f"{chunk_total:,.2f}")
 
-    # --- One page per receipt -----------------------------------------------
-    # Preferred: embed the soliq.uz screenshot we captured at save time,
-    # scaled to fit. Pixel-perfect match to the website — what the tax
-    # office sees on soliq.uz is exactly what's in the PDF.
-    # Fallback (old receipts saved before V.10): render the structured
-    # data with the existing Platypus renderer.
-    frame_w = width - 2 * margin
-    frame_h = height - 2 * margin - 8 * mm  # leave room for the page footer
-    for i, r in enumerate(chunk, 1):
-        global_i = global_offset + i
-        c.showPage()
-        rendered = False
-        shot_id = r.get("soliq_screenshot_file_id")
-        if shot_id:
-            try:
-                shot_bytes = await db.get_image(shot_id)
-                _draw_screenshot_page(
-                    c, shot_bytes, margin, margin + 8 * mm, frame_w, frame_h
-                )
-                rendered = True
-            except Exception:
-                logger.exception("Failed to render screenshot page; falling back to data renderer.")
-        if not rendered:
-            try:
-                story = _build_receipt_page_story(r, global_i, total_receipts, frame_w)
-                keeper = KeepInFrame(frame_w, frame_h, story, mode="shrink")
-                frame = Frame(
-                    margin, margin + 8 * mm, frame_w, frame_h,
-                    leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0,
-                    showBoundary=0,
-                )
-                frame.addFromList([keeper], c)
-            except Exception:
-                c.setFont("Helvetica-Oblique", 10)
-                c.drawString(margin, height / 2, "[Receipt could not be rendered]")
+    # --- Two receipts per page ---------------------------------------------
+    # Each receipt slot has the soliq.uz screenshot on the left and a
+    # scannable QR + a short identity block on the right. The QR encodes
+    # the soliq.uz URL so the tax office can verify any single receipt
+    # by scanning the PDF page directly. Old receipts saved before
+    # screenshots were captured fall back to a data render in the
+    # screenshot slot — the QR column still renders with the URL.
+    SLOTS_PER_PAGE = 2
+    footer_h = 8 * mm
+    usable_h = height - 2 * margin - footer_h
+    slot_h = usable_h / SLOTS_PER_PAGE
+    slot_w = width - 2 * margin
 
+    for page_start in range(0, len(chunk), SLOTS_PER_PAGE):
+        c.showPage()
+        page_receipts = chunk[page_start : page_start + SLOTS_PER_PAGE]
+        for slot_idx, r in enumerate(page_receipts):
+            global_i = global_offset + page_start + slot_idx + 1
+            # Top slot draws higher on the page than the bottom slot.
+            slot_y = margin + footer_h + (SLOTS_PER_PAGE - 1 - slot_idx) * slot_h
+            await _draw_receipt_slot(
+                c, r, global_i, total_receipts,
+                margin, slot_y, slot_w, slot_h,
+            )
+            # Thin divider between the two slots on the same page so the
+            # reader sees a clear boundary.
+            if slot_idx == 0 and len(page_receipts) > 1:
+                c.setStrokeColor(_RULE)
+                c.setLineWidth(0.5)
+                c.line(margin, slot_y, margin + slot_w, slot_y)
+
+        # Page footer
         c.setFont("Helvetica", 8)
         c.setFillGray(0.5)
         c.drawString(margin, margin / 2, employee_name or "")
-        c.drawRightString(width - margin, margin / 2, f"Receipt {global_i} of {total_receipts}")
+        last_i = global_offset + min(
+            page_start + SLOTS_PER_PAGE, len(chunk)
+        )
+        first_i = global_offset + page_start + 1
+        c.drawRightString(
+            width - margin, margin / 2,
+            f"Receipts {first_i}–{last_i} of {total_receipts}",
+        )
         c.setFillGray(0)
 
     c.save()
 
 
-def _draw_screenshot_page(c, shot_bytes: bytes, x: float, y: float,
-                          box_w: float, box_h: float) -> None:
-    """Embed a soliq.uz screenshot JPEG, scaled to fill the available
-    page box while preserving aspect ratio (the long, narrow receipt
-    captures naturally fill the page top-to-bottom)."""
+async def _draw_receipt_slot(c, r: dict, global_i: int, total_receipts: int,
+                             x: float, y: float, w: float, h: float) -> None:
+    """Render one receipt into a rectangle. Two-column body: screenshot
+    on the left, scannable QR + identity block on the right."""
+    HEADER_H = 7 * mm
+    pad = 2 * mm
+    body_y = y + pad
+    body_h = h - HEADER_H - pad * 2
+    header_y = y + h - HEADER_H
+
+    # Header bar (accent blue) with the receipt index + vendor name.
+    c.setFillColor(_ACCENT)
+    c.rect(x, header_y, w, HEADER_H, stroke=0, fill=1)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(x + 3 * mm, header_y + 2 * mm, f"Receipt #{global_i} of {total_receipts}")
+    vendor = (_display_vendor(r) or "—")[:60]
+    c.setFont("Helvetica", 9)
+    c.drawRightString(x + w - 3 * mm, header_y + 2 * mm, vendor)
+    c.setFillColor(colors.black)
+
+    # Body columns: screenshot left, QR + metadata right.
+    QR_COL_W = 62 * mm
+    GAP = 3 * mm
+    shot_col_w = w - QR_COL_W - GAP
+    qr_col_x = x + shot_col_w + GAP
+
+    # Left column — screenshot, or data-render fallback for old receipts.
+    shot_id = r.get("soliq_screenshot_file_id")
+    rendered = False
+    if shot_id:
+        try:
+            shot_bytes = await db.get_image(shot_id)
+            _draw_image_fit(c, shot_bytes, x, body_y, shot_col_w, body_h, anchor="top")
+            rendered = True
+        except Exception:
+            logger.exception("Failed to render screenshot in slot; using data fallback.")
+    if not rendered:
+        try:
+            story = _build_receipt_page_story(
+                r, global_i, total_receipts, shot_col_w, include_title=False,
+            )
+            keeper = KeepInFrame(shot_col_w, body_h, story, mode="shrink")
+            frame = Frame(
+                x, body_y, shot_col_w, body_h,
+                leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0,
+                showBoundary=0,
+            )
+            frame.addFromList([keeper], c)
+        except Exception:
+            c.setFont("Helvetica-Oblique", 9)
+            c.drawString(x + 3 * mm, body_y + body_h / 2, "[Receipt could not be rendered]")
+
+    # Right column — QR code + identity block.
+    _draw_qr_and_info(c, r, qr_col_x, body_y, QR_COL_W, body_h)
+
+
+def _draw_qr_and_info(c, r: dict, x: float, y: float, w: float, h: float) -> None:
+    """QR code (top) + label/value rows for date/receipt#/total/VAT
+    (bottom). The QR encodes the soliq.uz URL so the tax office can
+    scan the PDF page directly."""
+    soliq_url = r.get("soliq_url") or r.get("raw_qr") or ""
+    info_lines = [
+        ("Date", r.get("date") or "—"),
+        ("Receipt #", str(r.get("receipt_number") or "—")),
+        ("Total", f"{float(r.get('total_amount') or 0):,.2f} UZS"),
+        ("VAT", f"{float(r.get('vat_amount') or 0):,.2f} UZS"),
+    ]
+    meta = r.get("soliq_meta") or {}
+    if meta.get("stir"):
+        info_lines.append(("STIR", str(meta["stir"])))
+    if meta.get("time"):
+        info_lines.append(("Time", str(meta["time"])))
+
+    info_h = len(info_lines) * 4.5 * mm + 4 * mm
+    qr_caption_h = 4 * mm
+    qr_max = min(w, h - info_h - qr_caption_h - 4 * mm)
+    qr_size = max(20 * mm, min(qr_max, 55 * mm))
+    qr_x = x + (w - qr_size) / 2
+    qr_y = y + h - qr_size
+
+    if soliq_url:
+        try:
+            qr_png = _qr_png_bytes(soliq_url)
+            _draw_image_fit(c, qr_png, qr_x, qr_y, qr_size, qr_size, anchor="top")
+        except Exception:
+            logger.exception("Failed to render verification QR")
+        c.setFont("Helvetica", 7)
+        c.setFillColor(_MUTED)
+        c.drawCentredString(x + w / 2, qr_y - 3 * mm, "Scan to verify on soliq.uz")
+        c.setFillColor(colors.black)
+    else:
+        # Manual entry — no URL means no scannable proof. Say so plainly.
+        c.setFont("Helvetica-Oblique", 8)
+        c.setFillColor(_MUTED)
+        c.drawCentredString(x + w / 2, qr_y + qr_size / 2,
+                            "Manual entry (no soliq URL)")
+        c.setFillColor(colors.black)
+
+    # Identity block below the QR.
+    info_y = qr_y - qr_caption_h - 5 * mm
+    c.setFont("Helvetica", 8)
+    for label, value in info_lines:
+        c.setFillColor(_MUTED)
+        c.drawString(x, info_y, label)
+        c.setFillColor(colors.black)
+        # Truncate long values (long receipt numbers, etc.) to fit.
+        c.drawString(x + 17 * mm, info_y, value[:32])
+        info_y -= 4.5 * mm
+
+
+def _qr_png_bytes(data: str) -> bytes:
+    """Generate a PNG QR code that encodes `data`. M-level error
+    correction matches the soliq.uz fiscal receipts so a scanner that
+    handles the originals will handle this just as well."""
+    import qrcode
+    from io import BytesIO
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=6,
+        border=2,
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _draw_image_fit(c, img_bytes: bytes, x: float, y: float,
+                    box_w: float, box_h: float, anchor: str = "center") -> None:
+    """Draw an image scaled to fit inside the given box while preserving
+    aspect ratio. `anchor` controls vertical alignment:
+      - "top": image hugs the top of the box (good for tall screenshots
+        that would otherwise float in the middle with awkward whitespace).
+      - "center": image centered vertically (good for square content
+        like QR codes).
+    """
     from io import BytesIO
     from reportlab.lib.utils import ImageReader
     from PIL import Image
 
-    pil = Image.open(BytesIO(shot_bytes))
+    pil = Image.open(BytesIO(img_bytes))
     iw, ih = pil.size
     if iw == 0 or ih == 0:
         return
     ratio = min(box_w / iw, box_h / ih)
     dw, dh = iw * ratio, ih * ratio
-    # Center horizontally; anchor to the top of the box so a tall
-    # screenshot doesn't float in the middle with awkward white space
-    # above it.
     dx = x + (box_w - dw) / 2
-    dy = y + box_h - dh
+    if anchor == "top":
+        dy = y + box_h - dh
+    else:
+        dy = y + (box_h - dh) / 2
     c.drawImage(
-        ImageReader(BytesIO(shot_bytes)),
+        ImageReader(BytesIO(img_bytes)),
         dx, dy, width=dw, height=dh,
         preserveAspectRatio=True,
     )

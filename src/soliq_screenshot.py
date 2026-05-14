@@ -106,53 +106,54 @@ async def capture(url: str) -> Optional[bytes]:
                 except Exception:
                     pass
 
-                # The map widget injects into the bottom of the
-                # ticket-wrap container, so finding the bottom of the
-                # last totals row is the right anchor (it's above the
-                # map). We start from the bottom of the DOM and walk up
-                # to the first element whose own text starts with the
-                # totals label — this is robust against nested parents
-                # whose innerText accidentally contains the same string.
-                clip_height = await page.evaluate("""
+                # Find the receipt content's bounding box. We clip from
+                # the top of the .ticket-wrap div (skipping the SOLIQ
+                # mobile-app banner that wastes the top ~110 px) down
+                # to the bottom of the last totals row (skipping the
+                # Yandex map injected at the bottom of ticket-wrap).
+                bounds = await page.evaluate("""
                     () => {
+                        const wrap = document.querySelector(".ticket-wrap")
+                                 || document.querySelector("main")
+                                 || document.body;
+                        const wrapTop = wrap
+                            ? (wrap.getBoundingClientRect().top + window.scrollY)
+                            : 0;
                         const labels = ["jami to", "umumiy qqs", "umumiy q", "итого"];
                         const all = Array.from(document.querySelectorAll("body *"));
                         let bottom = 0;
                         for (const el of all) {
-                            // Skip elements that have children — we want
-                            // leaf-ish rows, not the whole table.
                             const direct = (el.textContent || "").trim().toLowerCase();
                             if (!direct) continue;
-                            const matches = labels.some(l => direct.startsWith(l));
-                            if (!matches) continue;
-                            // Restrict to elements that are small (a row,
-                            // not the wrapping div). If childElementCount
-                            // is large it's a container; we want the row.
+                            if (!labels.some(l => direct.startsWith(l))) continue;
+                            // Skip wrapping containers — we want the row.
                             if (el.childElementCount > 8) continue;
                             const rect = el.getBoundingClientRect();
-                            if (rect.bottom > bottom) {
-                                bottom = rect.bottom + window.scrollY;
-                            }
+                            const elBottom = rect.bottom + window.scrollY;
+                            if (elBottom > bottom) bottom = elBottom;
                         }
-                        return bottom;
+                        return { top: wrapTop, bottom: bottom };
                     }
                 """)
 
-                # full_page=True is required for clip to capture below
-                # the viewport fold. Without it, Playwright clamps clip
-                # to viewport height and the totals row gets chopped.
+                # full_page=True is required for clip to reach below the
+                # viewport fold. Without it Playwright clamps clip to
+                # viewport height and the totals row gets chopped.
                 screenshot_kwargs = {
                     "type": "jpeg",
                     "quality": 85,
                     "full_page": True,
                 }
-                if clip_height and clip_height > 200:
-                    # Pad 25 px so the bottom border of the totals row
-                    # doesn't get shaved off by sub-pixel rounding.
+                top = max(0, int(bounds.get("top") or 0))
+                bottom = int(bounds.get("bottom") or 0)
+                if bottom > top + 200:
+                    # Pad 25 px below the totals row so sub-pixel rounding
+                    # doesn't shave the bottom border off.
                     screenshot_kwargs["clip"] = {
-                        "x": 0, "y": 0,
+                        "x": 0,
+                        "y": top,
                         "width": _VIEWPORT_W,
-                        "height": int(clip_height) + 25,
+                        "height": (bottom - top) + 25,
                     }
 
                 png = await page.screenshot(**screenshot_kwargs)
