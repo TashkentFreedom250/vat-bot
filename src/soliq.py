@@ -180,6 +180,23 @@ def _normalize_json(data: dict, terminal: str, receipt: str) -> Optional[dict]:
             or data.get("date")
         )
         date_str = _parse_date(receipt_dt)
+        time_str = _parse_time(receipt_dt)
+
+        seller = data.get("seller") or {}
+        meta = {
+            "address": data.get("sellerAddress") or seller.get("address") or "",
+            "stir": (
+                data.get("companyTin")
+                or data.get("sellerTin")
+                or data.get("tin")
+                or seller.get("tin")
+                or ""
+            ),
+            "terminal": terminal or data.get("terminalId") or "",
+            "time": time_str,
+            "cashier": data.get("cashierName") or seller.get("cashier") or "",
+        }
+        items = _items_from_json(data)
 
         if not vendor and not total:
             return None
@@ -190,10 +207,45 @@ def _normalize_json(data: dict, terminal: str, receipt: str) -> Optional[dict]:
             "receipt_number": str(receipt),
             "vat_amount": _to_float(vat),
             "total_amount": _to_float(total),
+            "items": items,
+            "meta": {k: str(v) for k, v in meta.items() if v},
             "raw": {"source": "json", "terminal": terminal},
         }
     except Exception:
         return None
+
+
+def _items_from_json(data: dict) -> list[dict]:
+    """Normalize the items array out of a soliq JSON payload. Keys vary by
+    endpoint, so try the common spellings and skip anything that's not
+    obviously a line item."""
+    raw_items = data.get("items") or data.get("receiptItems") or []
+    if not isinstance(raw_items, list):
+        return []
+    out: list[dict] = []
+    for it in raw_items:
+        if not isinstance(it, dict):
+            continue
+        name = (
+            it.get("name")
+            or it.get("productName")
+            or it.get("title")
+            or ""
+        )
+        qty = _to_float(it.get("count") or it.get("quantity") or it.get("amount") or 0)
+        price = _to_float(it.get("price") or it.get("unitPrice") or 0)
+        line_total = _to_float(it.get("totalPrice") or it.get("sum") or it.get("total") or 0)
+        vat = _to_float(it.get("vatSum") or it.get("vatAmount") or it.get("vat") or 0)
+        if not name and qty == 0 and price == 0 and line_total == 0:
+            continue
+        out.append({
+            "name": str(name).strip(),
+            "qty": qty,
+            "price": price,
+            "total": line_total or (qty * price),
+            "vat": vat,
+        })
+    return out
 
 
 def _sum_vat_from_items(items: list) -> float:
@@ -230,6 +282,8 @@ def _parse_html(html: str, qr_url: str, fallback_date: str = "") -> Optional[dic
         total = _extract_total(text)
     date_str = _extract_date(text) or fallback_date
     receipt_no = _extract_receipt_number(text, qr_url)
+    items = _extract_items_from_html(soup)
+    meta = _extract_meta_from_html(soup, text)
 
     # If we got nothing usable, give up
     if vat is None and total is None and not vendor:
@@ -241,8 +295,147 @@ def _parse_html(html: str, qr_url: str, fallback_date: str = "") -> Optional[dic
         "receipt_number": receipt_no,
         "vat_amount": vat or 0.0,
         "total_amount": total or 0.0,
+        "items": items,
+        "meta": meta,
         "raw": {"source": "html"},
     }
+
+
+# Header labels that indicate a row is the items-table header (Uzbek/Russian).
+_ITEM_HEADER_HINTS = (
+    "tovar nomi", "tovar", "nomi", "mahsulot", "tovarlar",
+    "наименование", "tobap", "наим",
+)
+_QTY_HINTS = ("soni", "miqdor", "miqdori", "qty", "кол", "количество")
+_PRICE_HINTS = ("narx", "narxi", "unit", "цена", "narh")
+_VAT_HINTS = ("qqs", "ндс", "vat")
+_TOTAL_HINTS = ("jami", "summa", "сумма", "итого", "total")
+
+
+def _extract_items_from_html(soup: BeautifulSoup) -> list[dict]:
+    """Best-effort scrape of the line-items table on a soliq.uz receipt
+    page. Soliq's HTML varies by terminal vendor, so we look for any
+    table whose header row mentions a 'product name' label and parse the
+    rows that follow until totals/labels break the run.
+
+    Returns a list of {name, qty, price, total, vat}. Empty when no
+    items table can be identified — the caller treats this as "header
+    only" and the PDF renders without an item table."""
+    for table in soup.select("table"):
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            continue
+        header_cells = [
+            _normalize_text(td.get_text(" ", strip=True)).lower()
+            for td in rows[0].find_all(["td", "th"])
+        ]
+        if not header_cells or not any(
+            any(hint in cell for hint in _ITEM_HEADER_HINTS)
+            for cell in header_cells
+        ):
+            continue
+        col_map = _map_item_columns(header_cells)
+        if col_map.get("name") is None:
+            continue
+        items: list[dict] = []
+        for tr in rows[1:]:
+            cells = [
+                _normalize_text(td.get_text(" ", strip=True))
+                for td in tr.find_all(["td", "th"])
+            ]
+            if not cells or len(cells) < 2:
+                continue
+            name = cells[col_map["name"]] if col_map["name"] < len(cells) else ""
+            # Stop when we hit a totals/label row.
+            lowered = name.lower()
+            if any(hint in lowered for hint in ("jami", "umumiy", "итого", "to'lov")):
+                break
+            qty = _to_float(cells[col_map["qty"]]) if col_map.get("qty") is not None and col_map["qty"] < len(cells) else 0.0
+            price = _to_float(cells[col_map["price"]]) if col_map.get("price") is not None and col_map["price"] < len(cells) else 0.0
+            line_total = _to_float(cells[col_map["total"]]) if col_map.get("total") is not None and col_map["total"] < len(cells) else 0.0
+            vat = _to_float(cells[col_map["vat"]]) if col_map.get("vat") is not None and col_map["vat"] < len(cells) else 0.0
+            if not name and not line_total and not price:
+                continue
+            items.append({
+                "name": name,
+                "qty": qty,
+                "price": price,
+                "total": line_total or (qty * price),
+                "vat": vat,
+            })
+        if items:
+            return items
+    return []
+
+
+def _map_item_columns(header_cells: list[str]) -> dict:
+    """Given a header row's cell texts (already lower-cased), figure out
+    which column index holds the name, qty, price, vat, and total."""
+    mapping: dict = {"name": None, "qty": None, "price": None, "total": None, "vat": None}
+    for idx, cell in enumerate(header_cells):
+        if mapping["name"] is None and any(hint in cell for hint in _ITEM_HEADER_HINTS):
+            mapping["name"] = idx
+            continue
+        if mapping["qty"] is None and any(hint in cell for hint in _QTY_HINTS):
+            mapping["qty"] = idx
+            continue
+        if mapping["vat"] is None and any(hint in cell for hint in _VAT_HINTS):
+            mapping["vat"] = idx
+            continue
+        if mapping["price"] is None and any(hint in cell for hint in _PRICE_HINTS):
+            mapping["price"] = idx
+            continue
+        if mapping["total"] is None and any(hint in cell for hint in _TOTAL_HINTS):
+            mapping["total"] = idx
+            continue
+    return mapping
+
+
+_STIR_RE = re.compile(r"\b(\d{9})\b")
+_TIME_RE = re.compile(r"\b(\d{2}:\d{2}(?::\d{2})?)\b")
+
+
+def _extract_meta_from_html(soup: BeautifulSoup, text: str) -> dict:
+    """Pull supplementary metadata (address, STIR/INN, time, cashier,
+    terminal) out of a soliq.uz receipt page. All fields are optional —
+    missing keys are simply omitted from the dict."""
+    meta: dict = {}
+    address = _extract_labeled_text(soup, ("manzil", "yur. manzil", "адрес"))
+    if address:
+        meta["address"] = address
+    stir = _extract_labeled_text(soup, ("stir", "инн", "tin"))
+    if stir:
+        match = _STIR_RE.search(stir)
+        meta["stir"] = match.group(1) if match else stir.strip()
+    time_match = _TIME_RE.search(text)
+    if time_match:
+        meta["time"] = time_match.group(1)
+    cashier = _extract_labeled_text(soup, ("kassir", "кассир", "cashier"))
+    if cashier:
+        meta["cashier"] = cashier
+    terminal = _extract_labeled_text(soup, ("terminal", "терминал"))
+    if terminal:
+        meta["terminal"] = terminal
+    return meta
+
+
+def _extract_labeled_text(soup: BeautifulSoup, labels: tuple[str, ...]) -> str:
+    """Find a table row whose left cell mentions a label and return the
+    right cell's text."""
+    for tr in soup.select("tr"):
+        cells = [_normalize_text(td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
+        cells = [c for c in cells if c]
+        if len(cells) < 2:
+            continue
+        for idx, cell in enumerate(cells):
+            lowered = cell.lower()
+            if not any(label in lowered for label in labels):
+                continue
+            for value in cells[idx + 1:]:
+                value = value.strip(" :")
+                if value and value.lower() != cell.lower():
+                    return value
+    return ""
 
 
 # --- Extraction helpers --------------------------------------------------
@@ -457,6 +650,16 @@ def _parse_date(val) -> str:
             continue
     # Last resort: look for a date inside
     return _extract_date(s)
+
+
+def _parse_time(val) -> str:
+    """Extract HH:MM (or HH:MM:SS) from a soliq datetime string. Returns
+    empty string if nothing time-shaped is found."""
+    if not val:
+        return ""
+    s = str(val)
+    match = _TIME_RE.search(s)
+    return match.group(1) if match else ""
 
 
 def _to_float(x) -> float:

@@ -5,16 +5,23 @@ and to a PDF containing all receipt images.
 from __future__ import annotations
 
 import shutil
-from io import BytesIO
 from pathlib import Path
-from typing import Iterable
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font
+from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
-from PIL import Image
+from reportlab.platypus import (
+    Frame,
+    KeepInFrame,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 from . import config, db
 
@@ -143,101 +150,10 @@ def build_xlsx_from_receipts(
     return output_path
 
 
-_PDF_DPI = 180  # sharp enough to read receipt text; keeps files small
-_PDF_JPEG_QUALITY = 78
-
-
-def _draw_pil(c, pil_img: "Image.Image", box_x: float, box_y: float,
-              box_w: float, box_h: float) -> None:
-    """Draw a PIL image scaled to fit and centered inside the given box.
-
-    Downscales and JPEG-encodes so PDFs stay under Telegram's 50 MB cap —
-    receipts packed with full-res PNG pages balloon fast.
-    """
-    from reportlab.lib.utils import ImageReader
-    iw, ih = pil_img.size
-    if iw == 0 or ih == 0:
-        return
-    ratio = min(box_w / iw, box_h / ih)
-    dw, dh = iw * ratio, ih * ratio
-    dx = box_x + (box_w - dw) / 2
-    dy = box_y + (box_h - dh) / 2
-
-    # Downscale to the printed size at _PDF_DPI. reportlab draws in points
-    # (72/inch), so target-pixel = drawn_points * DPI / 72.
-    target_w = max(1, int(dw * _PDF_DPI / 72))
-    if target_w < iw:
-        target_h = max(1, int(ih * target_w / iw))
-        pil_img = pil_img.resize((target_w, target_h), Image.LANCZOS)
-
-    buf = BytesIO()
-    pil_img.save(buf, format="JPEG", quality=_PDF_JPEG_QUALITY, optimize=True)
-    buf.seek(0)
-    c.drawImage(ImageReader(buf), dx, dy, width=dw, height=dh)
-
-
-def _strip_coverage(n_cols: int, iw: int, ih: int,
-                    box_w: float, box_h: float, gap: float) -> float:
-    """Total drawn area if the image is sliced into n equal-height strips side by side."""
-    if n_cols < 1:
-        return 0.0
-    col_w = (box_w - (n_cols - 1) * gap) / n_cols
-    if col_w <= 0:
-        return 0.0
-    strip_h = ih / n_cols
-    ratio = min(col_w / iw, box_h / strip_h)
-    return n_cols * (iw * ratio) * (strip_h * ratio)
-
-
-def _draw_receipt_images(
-    c,
-    img_bytes: bytes,
-    qr_bytes: "bytes | None",
-    x: float,
-    y: float,
-    max_w: float,
-    max_h: float,
-) -> None:
-    """
-    Render receipt image(s) so they fill as much of the box as possible.
-
-    • QR close-up present: receipt 2/3 width, QR 1/3 width, each centered.
-    • No QR close-up: try 1, 2, and 3 vertical-strip layouts; pick whichever
-      covers the largest area of the page box.
-    """
-    gap = 3 * mm
-    pil_main = Image.open(BytesIO(img_bytes)).convert("RGB")
-    iw, ih = pil_main.size
-
-    if qr_bytes:
-        receipt_w = (max_w - gap) * 2 / 3
-        qr_w = max_w - gap - receipt_w
-        _draw_pil(c, pil_main, x, y, receipt_w, max_h)
-        pil_qr = Image.open(BytesIO(qr_bytes)).convert("RGB")
-        _draw_pil(c, pil_qr, x + receipt_w + gap, y, qr_w, max_h)
-        return
-
-    best_n = max(
-        (1, 2, 3),
-        key=lambda n: _strip_coverage(n, iw, ih, max_w, max_h, gap),
-    )
-
-    if best_n == 1:
-        _draw_pil(c, pil_main, x, y, max_w, max_h)
-        return
-
-    col_w = (max_w - (best_n - 1) * gap) / best_n
-    strip_h = ih // best_n
-    for i in range(best_n):
-        top = i * strip_h
-        bot = ih if i == best_n - 1 else (i + 1) * strip_h
-        strip = pil_main.crop((0, top, iw, bot))
-        _draw_pil(c, strip, x + i * (col_w + gap), y, col_w, max_h)
-
-
-# Cap per-PDF receipt count to stay safely under Telegram's 50 MB upload
-# limit even when users have lots of long receipts.
-RECEIPTS_PER_PDF = 30
+# Each receipt is one rendered page (no embedded photos), so PDFs stay
+# small. The cap is kept generous to limit cover-page bloat and keep a
+# single year manageable for the tax office to review.
+RECEIPTS_PER_PDF = 60
 
 
 async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> Path:
@@ -300,6 +216,252 @@ async def build_pdfs_from_receipts(
     return out_paths
 
 
+# ---- Per-receipt PDF page (soliq.uz data, no embedded photo) -----------
+#
+# The tax office now takes the originals and only needs a digital index,
+# so each receipt is rendered as a single page using the structured
+# soliq.uz data instead of the receipt photograph. Header block at the
+# top, line-items table in the middle (if available), totals + soliq URL
+# footer at the bottom. A KeepInFrame in 'shrink' mode auto-scales the
+# whole block to fit one page even for receipts with many items.
+
+_ACCENT = colors.HexColor("#0c4a8a")
+_MUTED = colors.HexColor("#666666")
+_RULE = colors.HexColor("#cfd6df")
+_ZEBRA = colors.HexColor("#f3f5f8")
+
+_STYLE_TITLE = ParagraphStyle(
+    "title", fontName="Helvetica-Bold", fontSize=13, leading=15,
+    textColor=colors.white,
+)
+_STYLE_SECTION = ParagraphStyle(
+    "section", fontName="Helvetica-Bold", fontSize=10, leading=12,
+    textColor=_ACCENT, spaceBefore=2, spaceAfter=2,
+)
+_STYLE_LABEL = ParagraphStyle(
+    "label", fontName="Helvetica", fontSize=9, leading=11, textColor=_MUTED,
+)
+_STYLE_VALUE = ParagraphStyle(
+    "value", fontName="Helvetica-Bold", fontSize=10, leading=12,
+    textColor=colors.black,
+)
+_STYLE_BODY = ParagraphStyle(
+    "body", fontName="Helvetica", fontSize=9, leading=11,
+)
+_STYLE_FOOTER = ParagraphStyle(
+    "footer", fontName="Helvetica", fontSize=7, leading=9, textColor=_MUTED,
+)
+_STYLE_TOTAL = ParagraphStyle(
+    "total", fontName="Helvetica-Bold", fontSize=13, leading=15,
+    textColor=_ACCENT, alignment=2,  # right-aligned
+)
+
+
+def _esc(text) -> str:
+    """HTML-escape a value for safe rendering inside a Paragraph, and
+    normalize typographic punctuation that reportlab's default Helvetica
+    can't render (Uzbek receipts use the curly apostrophe in words like
+    "ko'chasi" and "o'zbek" — without normalization those glyphs show as
+    a tofu rectangle)."""
+    s = "" if text is None else str(text)
+    s = (
+        s.replace("‘", "'").replace("’", "'")
+        .replace("“", '"').replace("”", '"')
+        .replace("ʻ", "'").replace("ʼ", "'")
+        .replace("′", "'").replace("″", '"')
+        .replace("–", "-").replace("—", "-")
+        .replace(" ", " ")
+    )
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _build_receipt_page_story(r: dict, global_i: int, total_receipts: int,
+                              frame_w: float) -> list:
+    """Build the Platypus story for a single receipt's page. Returned
+    flowables are wrapped in a KeepInFrame by the caller so the whole
+    block shrinks to fit one page when items spill over."""
+    vendor = _display_vendor(r) or "—"
+    date = r.get("date") or "—"
+    receipt_no = r.get("receipt_number") or "—"
+    total = float(r.get("total_amount") or 0)
+    vat = float(r.get("vat_amount") or 0)
+    soliq_url = r.get("soliq_url") or r.get("raw_qr") or ""
+    meta = r.get("soliq_meta") or {}
+    items = r.get("soliq_items") or []
+
+    story: list = []
+
+    # Title bar: blue band with the page index and a soliq.uz badge.
+    badge = "Verified by soliq.uz" if soliq_url else "Manual entry"
+    title_table = Table(
+        [[Paragraph(f"Receipt #{global_i} of {total_receipts}", _STYLE_TITLE),
+          Paragraph(badge, _STYLE_TITLE)]],
+        colWidths=[frame_w * 0.55, frame_w * 0.45],
+    )
+    title_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), _ACCENT),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+    ]))
+    story.append(title_table)
+    story.append(Spacer(0, 6))
+
+    # Header block — two columns of label/value pairs so the page reads
+    # like the soliq.uz page itself (vendor first, then receipt-level
+    # identifiers).
+    header_rows = [
+        ("Vendor", vendor),
+        ("Date", date),
+        ("Receipt #", receipt_no),
+    ]
+    if meta.get("time"):
+        header_rows.append(("Time", meta["time"]))
+    if meta.get("stir"):
+        header_rows.append(("STIR / INN", meta["stir"]))
+    if meta.get("terminal"):
+        header_rows.append(("Terminal", meta["terminal"]))
+    if meta.get("address"):
+        header_rows.append(("Address", meta["address"]))
+    if meta.get("cashier"):
+        header_rows.append(("Cashier", meta["cashier"]))
+
+    # Lay out as two columns of (label, value, label, value) so we use
+    # the width efficiently and short fields don't waste a line.
+    table_rows = []
+    for i in range(0, len(header_rows), 2):
+        left = header_rows[i]
+        right = header_rows[i + 1] if i + 1 < len(header_rows) else ("", "")
+        table_rows.append([
+            Paragraph(_esc(left[0]), _STYLE_LABEL),
+            Paragraph(_esc(left[1]), _STYLE_VALUE),
+            Paragraph(_esc(right[0]), _STYLE_LABEL),
+            Paragraph(_esc(right[1]), _STYLE_VALUE),
+        ])
+    header_table = Table(
+        table_rows,
+        colWidths=[
+            frame_w * 0.13, frame_w * 0.37,
+            frame_w * 0.13, frame_w * 0.37,
+        ],
+    )
+    header_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    story.append(header_table)
+    story.append(Spacer(0, 6))
+
+    # Items table — only rendered when the soliq scrape captured items.
+    # Old receipts saved before this rewrite have an empty list and skip
+    # straight to totals, which still looks fine.
+    if items:
+        story.append(Paragraph("Items", _STYLE_SECTION))
+        item_rows = [[
+            Paragraph("<b>#</b>", _STYLE_BODY),
+            Paragraph("<b>Product</b>", _STYLE_BODY),
+            Paragraph("<b>Qty</b>", _STYLE_BODY),
+            Paragraph("<b>Price</b>", _STYLE_BODY),
+            Paragraph("<b>VAT</b>", _STYLE_BODY),
+            Paragraph("<b>Total</b>", _STYLE_BODY),
+        ]]
+        for idx, item in enumerate(items, 1):
+            qty = float(item.get("qty") or 0)
+            price = float(item.get("price") or 0)
+            line_total = float(item.get("total") or 0)
+            line_vat = float(item.get("vat") or 0)
+            item_rows.append([
+                Paragraph(str(idx), _STYLE_BODY),
+                Paragraph(_esc(item.get("name") or ""), _STYLE_BODY),
+                Paragraph(f"{qty:g}" if qty else "—", _STYLE_BODY),
+                Paragraph(f"{price:,.2f}" if price else "—", _STYLE_BODY),
+                Paragraph(f"{line_vat:,.2f}" if line_vat else "—", _STYLE_BODY),
+                Paragraph(f"{line_total:,.2f}" if line_total else "—", _STYLE_BODY),
+            ])
+        items_table = Table(
+            item_rows,
+            colWidths=[
+                frame_w * 0.05,
+                frame_w * 0.49,
+                frame_w * 0.08,
+                frame_w * 0.13,
+                frame_w * 0.11,
+                frame_w * 0.14,
+            ],
+            repeatRows=1,
+        )
+        items_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), _ACCENT),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("ALIGN", (2, 1), (-1, -1), "RIGHT"),
+            ("ALIGN", (0, 1), (0, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, _ZEBRA]),
+            ("LINEBELOW", (0, 0), (-1, 0), 0.5, _ACCENT),
+            ("LINEBELOW", (0, -1), (-1, -1), 0.5, _RULE),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 2),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        story.append(items_table)
+        story.append(Spacer(0, 4))
+
+    # Totals block: subtotal (only when total > vat so we don't print a
+    # negative number on manual entries that lack the gross amount), VAT,
+    # and the grand-total anchor.
+    totals_rows = []
+    if total > vat > 0:
+        totals_rows.append([
+            Paragraph("Subtotal", _STYLE_LABEL),
+            Paragraph(f"{total - vat:,.2f} UZS", _STYLE_VALUE),
+        ])
+    totals_rows.append([
+        Paragraph("VAT (QQS)", _STYLE_LABEL),
+        Paragraph(f"{vat:,.2f} UZS", _STYLE_VALUE),
+    ])
+    if total > 0:
+        totals_rows.append([
+            Paragraph("<b>TOTAL</b>", _STYLE_SECTION),
+            Paragraph(f"{total:,.2f} UZS", _STYLE_TOTAL),
+        ])
+    totals_table = Table(
+        totals_rows,
+        colWidths=[frame_w * 0.7, frame_w * 0.3],
+    )
+    totals_table.setStyle(TableStyle([
+        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("LINEABOVE", (0, -1), (-1, -1), 0.5, _ACCENT),
+        ("LINEBELOW", (0, -1), (-1, -1), 1.2, _ACCENT),
+    ]))
+    story.append(Spacer(0, 4))
+    story.append(totals_table)
+
+    if soliq_url:
+        story.append(Spacer(0, 6))
+        story.append(Paragraph(
+            f"Source: <font color='#0c4a8a'>{_esc(soliq_url)}</font>",
+            _STYLE_FOOTER,
+        ))
+
+    return story
+
+
 async def _write_pdf_chunk(
     *,
     chunk: list[dict],
@@ -316,7 +478,7 @@ async def _write_pdf_chunk(
     margin = 15 * mm
 
     # --- Cover / summary page ---
-    title = "Tashkent Embassy VAT Refund V1 - Receipt Package"
+    title = "Tashkent Embassy VAT Refund — Receipt Package"
     if total_parts > 1:
         title += f"  (Part {part_idx} of {total_parts})"
     c.setFont("Helvetica-Bold", 16)
@@ -369,46 +531,28 @@ async def _write_pdf_chunk(
     c.drawString(margin + 100 * mm, y, "SUBTOTAL" if total_parts > 1 else "TOTAL")
     c.drawRightString(margin + 185 * mm, y, f"{chunk_total:,.2f}")
 
-    # --- One page per receipt image ---
+    # --- One page per receipt, rendered from soliq.uz data ---
+    frame_w = width - 2 * margin
+    frame_h = height - 2 * margin - 8 * mm  # leave room for the page footer
     for i, r in enumerate(chunk, 1):
         global_i = global_offset + i
-        file_id = r.get("image_file_id")
-        if not file_id:
-            continue
-        try:
-            img_bytes = await db.get_image(file_id)
-        except Exception:
-            continue
-
-        qr_bytes = None
-        if r.get("qr_image_file_id"):
-            try:
-                qr_bytes = await db.get_image(r["qr_image_file_id"])
-            except Exception:
-                pass
-
         c.showPage()
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(margin, height - margin, f"Receipt #{global_i}")
-        c.setFont("Helvetica", 10)
-        c.drawString(
-            margin, height - margin - 6 * mm,
-            f"{r.get('date','') or '—'}  •  {_display_vendor(r) or '—'}  •  "
-            f"VAT: {float(r.get('vat_amount') or 0):,.2f} UZS",
-        )
-
-        img_box_y = margin + 6 * mm
-        img_box_h = height - margin - 12 * mm - img_box_y
-        img_box_w = width - 2 * margin
-
         try:
-            _draw_receipt_images(c, img_bytes, qr_bytes, margin, img_box_y, img_box_w, img_box_h)
+            story = _build_receipt_page_story(r, global_i, total_receipts, frame_w)
+            keeper = KeepInFrame(frame_w, frame_h, story, mode="shrink")
+            frame = Frame(
+                margin, margin + 8 * mm, frame_w, frame_h,
+                leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0,
+                showBoundary=0,
+            )
+            frame.addFromList([keeper], c)
         except Exception:
             c.setFont("Helvetica-Oblique", 10)
-            c.drawString(margin, height / 2, "[Image could not be rendered]")
+            c.drawString(margin, height / 2, "[Receipt could not be rendered]")
 
         c.setFont("Helvetica", 8)
         c.setFillGray(0.5)
+        c.drawString(margin, margin / 2, employee_name or "")
         c.drawRightString(width - margin, margin / 2, f"Receipt {global_i} of {total_receipts}")
         c.setFillGray(0)
 

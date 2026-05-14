@@ -328,6 +328,8 @@ async def _save_verified_receipt(
         "total_amount": data.get("total_amount", 0.0),
         "soliq_url": qr_url,
         "raw_qr": qr_url,
+        "soliq_items": data.get("items") or [],
+        "soliq_meta": data.get("meta") or {},
     }
     inserted = await db.save_receipt(receipt_doc)
     if inserted is None:
@@ -502,7 +504,7 @@ async def access_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 # ---------- Commands ----------
 
 _WELCOME_HTML = (
-    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.8.0</b>\n\n"
+    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.9.0</b>\n\n"
     "Hi <b>{first_name}</b>! 👋\n"
     "Just send me a 📸 photo of any receipt — I read the QR and save it.\n\n"
 
@@ -975,7 +977,7 @@ async def _build_heartcheck_report() -> str:
     proxy_note = " (proxy)" if config.SOLIQ_PROXY else ""
 
     return (
-        "<b>🔧 Heartcheck — V.8.0</b>\n\n"
+        "<b>🔧 Heartcheck — V.9.0</b>\n\n"
         f"Status: ✅ alive\n"
         f"Uptime: {uptime_str}\n"
         f"PID: {pid}\n"
@@ -1272,6 +1274,8 @@ async def _save_online_purchase(
         "soliq_url": qr_url,
         "raw_qr": qr_url,
         "online_purchase": True,
+        "soliq_items": data.get("items") or [],
+        "soliq_meta": data.get("meta") or {},
     }
     inserted = await db.save_receipt(receipt_doc)
     if inserted is None:
