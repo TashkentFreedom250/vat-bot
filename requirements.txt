@@ -17,3 +17,5 @@ qrcode==7.4.2
 python-dotenv==1.0.1
 zstandard>=0.22.0
 python-snappy>=0.7.3
+pyzbar==0.1.9
+playwright==1.59.0

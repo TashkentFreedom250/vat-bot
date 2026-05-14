@@ -4,6 +4,7 @@ and to a PDF containing all receipt images.
 """
 from __future__ import annotations
 
+import logging
 import shutil
 from pathlib import Path
 
@@ -24,6 +25,8 @@ from reportlab.platypus import (
 )
 
 from . import config, db
+
+logger = logging.getLogger("vat_bot.exporter")
 
 # XLSX layout (inspected from the template):
 # Columns: A=#, B=Date, C=Vendor, D=Receipt#, E=VAT Amount
@@ -531,24 +534,41 @@ async def _write_pdf_chunk(
     c.drawString(margin + 100 * mm, y, "SUBTOTAL" if total_parts > 1 else "TOTAL")
     c.drawRightString(margin + 185 * mm, y, f"{chunk_total:,.2f}")
 
-    # --- One page per receipt, rendered from soliq.uz data ---
+    # --- One page per receipt -----------------------------------------------
+    # Preferred: embed the soliq.uz screenshot we captured at save time,
+    # scaled to fit. Pixel-perfect match to the website — what the tax
+    # office sees on soliq.uz is exactly what's in the PDF.
+    # Fallback (old receipts saved before V.10): render the structured
+    # data with the existing Platypus renderer.
     frame_w = width - 2 * margin
     frame_h = height - 2 * margin - 8 * mm  # leave room for the page footer
     for i, r in enumerate(chunk, 1):
         global_i = global_offset + i
         c.showPage()
-        try:
-            story = _build_receipt_page_story(r, global_i, total_receipts, frame_w)
-            keeper = KeepInFrame(frame_w, frame_h, story, mode="shrink")
-            frame = Frame(
-                margin, margin + 8 * mm, frame_w, frame_h,
-                leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0,
-                showBoundary=0,
-            )
-            frame.addFromList([keeper], c)
-        except Exception:
-            c.setFont("Helvetica-Oblique", 10)
-            c.drawString(margin, height / 2, "[Receipt could not be rendered]")
+        rendered = False
+        shot_id = r.get("soliq_screenshot_file_id")
+        if shot_id:
+            try:
+                shot_bytes = await db.get_image(shot_id)
+                _draw_screenshot_page(
+                    c, shot_bytes, margin, margin + 8 * mm, frame_w, frame_h
+                )
+                rendered = True
+            except Exception:
+                logger.exception("Failed to render screenshot page; falling back to data renderer.")
+        if not rendered:
+            try:
+                story = _build_receipt_page_story(r, global_i, total_receipts, frame_w)
+                keeper = KeepInFrame(frame_w, frame_h, story, mode="shrink")
+                frame = Frame(
+                    margin, margin + 8 * mm, frame_w, frame_h,
+                    leftPadding=0, rightPadding=0, topPadding=0, bottomPadding=0,
+                    showBoundary=0,
+                )
+                frame.addFromList([keeper], c)
+            except Exception:
+                c.setFont("Helvetica-Oblique", 10)
+                c.drawString(margin, height / 2, "[Receipt could not be rendered]")
 
         c.setFont("Helvetica", 8)
         c.setFillGray(0.5)
@@ -557,3 +577,30 @@ async def _write_pdf_chunk(
         c.setFillGray(0)
 
     c.save()
+
+
+def _draw_screenshot_page(c, shot_bytes: bytes, x: float, y: float,
+                          box_w: float, box_h: float) -> None:
+    """Embed a soliq.uz screenshot JPEG, scaled to fill the available
+    page box while preserving aspect ratio (the long, narrow receipt
+    captures naturally fill the page top-to-bottom)."""
+    from io import BytesIO
+    from reportlab.lib.utils import ImageReader
+    from PIL import Image
+
+    pil = Image.open(BytesIO(shot_bytes))
+    iw, ih = pil.size
+    if iw == 0 or ih == 0:
+        return
+    ratio = min(box_w / iw, box_h / ih)
+    dw, dh = iw * ratio, ih * ratio
+    # Center horizontally; anchor to the top of the box so a tall
+    # screenshot doesn't float in the middle with awkward white space
+    # above it.
+    dx = x + (box_w - dw) / 2
+    dy = y + box_h - dh
+    c.drawImage(
+        ImageReader(BytesIO(shot_bytes)),
+        dx, dy, width=dw, height=dh,
+        preserveAspectRatio=True,
+    )

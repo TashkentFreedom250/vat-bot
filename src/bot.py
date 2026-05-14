@@ -44,6 +44,7 @@ from . import (
     receipt_image,
     receipt_ocr,
     soliq,
+    soliq_screenshot,
 )
 
 
@@ -297,13 +298,25 @@ async def _save_verified_receipt(
             False,
         )
 
-    printed_vendor = None
-    try:
-        printed_vendor = await loop.run_in_executor(
-            None, receipt_ocr.extract_printed_vendor, source_image_bytes
-        )
-    except Exception:
-        logger.exception("Printed vendor OCR failed")
+    # Run printed-vendor OCR and the soliq.uz page screenshot in parallel.
+    # Both take ~1-2 s; sequencing them would double the user-visible save
+    # delay. The screenshot is the visual record we embed in the export
+    # PDF — failure here is non-fatal (we fall back to the data renderer).
+    printed_vendor_task = loop.run_in_executor(
+        None, receipt_ocr.extract_printed_vendor, source_image_bytes
+    )
+    screenshot_task = soliq_screenshot.capture(qr_url)
+    printed_vendor_result, screenshot_bytes = await asyncio.gather(
+        printed_vendor_task, screenshot_task, return_exceptions=True
+    )
+    if isinstance(printed_vendor_result, BaseException):
+        logger.exception("Printed vendor OCR failed", exc_info=printed_vendor_result)
+        printed_vendor = None
+    else:
+        printed_vendor = printed_vendor_result
+    if isinstance(screenshot_bytes, BaseException):
+        logger.exception("soliq screenshot capture raised", exc_info=screenshot_bytes)
+        screenshot_bytes = None
 
     display_vendor = data.get("vendor", "") or printed_vendor or ""
     file_id = await db.save_image(uid, source_image_bytes, f"receipt_{uid}.png")
@@ -315,10 +328,20 @@ async def _save_verified_receipt(
         except Exception:
             logger.exception("Failed to save QR close-up image")
 
+    screenshot_file_id = None
+    if screenshot_bytes:
+        try:
+            screenshot_file_id = await db.save_image(
+                uid, screenshot_bytes, f"soliq_{uid}.jpg"
+            )
+        except Exception:
+            logger.exception("Failed to save soliq screenshot")
+
     receipt_doc = {
         "telegram_id": uid,
         "image_file_id": file_id,
         "qr_image_file_id": qr_file_id,
+        "soliq_screenshot_file_id": screenshot_file_id,
         "date": data.get("date", ""),
         "vendor": data.get("vendor", ""),
         "printed_vendor": printed_vendor or "",
@@ -504,7 +527,7 @@ async def access_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 # ---------- Commands ----------
 
 _WELCOME_HTML = (
-    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.9.0</b>\n\n"
+    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.10.0</b>\n\n"
     "Hi <b>{first_name}</b>! 👋\n"
     "Just send me a 📸 photo of any receipt — I read the QR and save it.\n\n"
 
@@ -977,7 +1000,7 @@ async def _build_heartcheck_report() -> str:
     proxy_note = " (proxy)" if config.SOLIQ_PROXY else ""
 
     return (
-        "<b>🔧 Heartcheck — V.9.0</b>\n\n"
+        "<b>🔧 Heartcheck — V.10.0</b>\n\n"
         f"Status: ✅ alive\n"
         f"Uptime: {uptime_str}\n"
         f"PID: {pid}\n"
@@ -1260,10 +1283,22 @@ async def _save_online_purchase(
         # Save the receipt without an image rather than dropping the entry.
         file_id = None
 
+    # Capture the soliq.uz page for the PDF export. Non-fatal on failure.
+    screenshot_file_id = None
+    try:
+        screenshot_bytes = await soliq_screenshot.capture(qr_url)
+        if screenshot_bytes:
+            screenshot_file_id = await db.save_image(
+                uid, screenshot_bytes, f"soliq_{uid}.jpg"
+            )
+    except Exception:
+        logger.exception("Failed to capture/save soliq screenshot (online)")
+
     receipt_doc = {
         "telegram_id": uid,
         "image_file_id": file_id,
         "qr_image_file_id": None,
+        "soliq_screenshot_file_id": screenshot_file_id,
         "date": data.get("date", ""),
         "vendor": data.get("vendor", ""),
         "printed_vendor": "",
@@ -1831,12 +1866,29 @@ async def _post_init(app: Application) -> None:
             "to enable self-managed backups."
         )
 
+    # Warm up the headless Chromium that captures soliq.uz screenshots
+    # for the PDF export. Launching once at startup keeps per-receipt
+    # save latency low (one cold-start chromium is ~2s).
+    try:
+        await soliq_screenshot.startup()
+    except Exception:
+        logger.exception("soliq_screenshot startup failed (PDF will use data renderer).")
+
+
+async def _post_shutdown(app: Application) -> None:
+    """Close the shared Playwright browser cleanly when the bot exits."""
+    try:
+        await soliq_screenshot.shutdown()
+    except Exception:
+        logger.debug("soliq_screenshot shutdown raised", exc_info=True)
+
 
 def _build_app() -> Application:
     app = (
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
         .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
         .concurrent_updates(True)
         # Generous long-poll timeouts — WiFi jitters on cafe/hotel networks
         # caused httpx.ConnectError bursts during get_updates.
