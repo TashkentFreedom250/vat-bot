@@ -1,16 +1,17 @@
-# Tashkent Embassy VAT Refund Bot — V8
+# Tashkent Embassy VAT Refund Bot — V12
 
 A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts and file VAT refund requests automatically. Access is gated to approved staff via a DT-managed approval queue.
 
 ## What it does
 
-1. User sends a photo of a receipt
+1. User sends a photo of a receipt (close-up of just the QR code is enough — the tax office takes the original paper receipt)
 2. Bot **auto-crops** the receipt from the photo background
-3. Bot **decodes the QR code** on the receipt
+3. Bot **decodes the QR code** with a multi-decoder stack (zxing-cpp, OpenCV classic + Aruco, pyzbar) with EXIF-orientation handling, multi-border quiet-zone restoration, and blur-triggered deblur passes
 4. Bot fetches **verified VAT data from soliq.uz** (Uzbekistan tax authority) — not from OCR, so the amounts are always correct
-5. If the QR is unreadable, the user can fall back to `/manual` and type the amounts in
-6. All receipts are stored per user in MongoDB (image + metadata)
-7. On command, bot generates the official **VAT_Refund.xlsx** already filled in (split by calendar year when receipts span multiple years), or a **PDF** with all receipt images
+5. Bot **captures a headless-Chromium screenshot of the soliq.uz page** at save time (clipped to the totals row, map widget removed) — this is the visual record used in the PDF export, pixel-perfect against the website
+6. If the QR is unreadable, the user can fall back to `/manual` and type the amounts in
+7. All receipts are stored per user in MongoDB (screenshot + photo + metadata via GridFS)
+8. On command, bot generates the official **VAT_Refund.xlsx** already filled in (split by calendar year when receipts span multiple years), or a **PDF package** with one page per receipt: the soliq.uz screenshot on the left and a large scannable QR (encoding the soliq URL) plus the identity block on the right, so the tax office can verify any receipt by scanning the printed page
 
 ## Commands
 
@@ -26,7 +27,7 @@ A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts an
 | `/cancel_pending` | Discard a receipt waiting for a QR close-up |
 | `/list` | List all stored receipts |
 | `/export_vat` | Download filled `VAT_Refund.xlsx` (one file per year, split into copies of 120 if needed) |
-| `/export_pdf` | Download PDF package (summary + images) |
+| `/export_pdf` | Download PDF package (summary cover + one page per receipt: soliq.uz screenshot + scannable QR) |
 | `/reset` | Delete all receipts |
 | `/help` | Show help |
 
@@ -35,7 +36,7 @@ A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts an
 ### Hidden commands
 
 - **DT approvers** (`APPROVER_TELEGRAM_IDS`): `/pending` lists access requests, `/approve <user_id>` and `/deny <user_id>` resolve them via command (in addition to the inline buttons sent on each new request).
-- **Technical admins** (`ADMIN_TELEGRAM_IDS`): `/heartcheck` returns a health snapshot (DB reachable, uptime, GridFS size, backup age, today's error count).
+- **Technical admins** (`ADMIN_TELEGRAM_IDS`): `/heartcheck` returns a health snapshot (DB reachable, uptime, GridFS size, backup age, today's error count). `/report` returns a per-user VAT-savings report across the full receipt history — total VAT refundable, per-user breakdown sorted by savings, receipt counts and date ranges.
 - **Anyone**: `/whoami` replies with the caller's Telegram ID — used to collect IDs from new DT staff before adding them to `APPROVER_TELEGRAM_IDS`.
 
 All hidden commands silently no-op for anyone not on the relevant list — they don't appear in the Telegram command menu.
@@ -107,11 +108,12 @@ vat-bot/
 │   ├── bot.py              # Telegram handlers + entry point
 │   ├── config.py           # Env loading
 │   ├── db.py               # MongoDB + GridFS (async)
-│   ├── receipt_image.py    # Auto-crop + QR decode
+│   ├── receipt_image.py    # Auto-crop + multi-decoder QR pipeline (zxing, OpenCV, Aruco, pyzbar)
 │   ├── receipt_ocr.py      # Optional OCR fallback (RapidOCR)
 │   ├── online_snapshot.py  # Synthetic PNG for /online_purchase entries
-│   ├── soliq.py            # Fetch verified VAT data from soliq.uz
-│   ├── exporter.py         # XLSX + PDF export (year-split + copy-split aware)
+│   ├── soliq.py            # Fetch verified VAT data from soliq.uz (JSON + HTML, items + meta)
+│   ├── soliq_screenshot.py # Headless-Chromium capture of the soliq.uz page (Playwright)
+│   ├── exporter.py         # XLSX + PDF export (year-split, screenshot+QR per page)
 │   └── maintenance.py      # Nightly backup + disk/log housekeeping
 ├── templates/
 │   └── VAT_Refund.xlsx     # Official template
@@ -130,17 +132,19 @@ vat-bot/
 
 - **python-telegram-bot 21** — bot framework (async)
 - **MongoDB Community + Motor + GridFS** — local receipt storage (free, no cloud needed)
-- **OpenCV + Pillow + pillow-heif** — auto-crop receipts via contour detection + perspective warp; HEIC support for iPhone photos
-- **zxing-cpp** — QR code decoding (replaced `pyzbar` to avoid macOS segfaults)
-- **RapidOCR + ONNX Runtime** — optional OCR fallback for unreadable QRs
-- **httpx + BeautifulSoup + lxml** — async scraping of soliq.uz / ofd.soliq.uz
+- **OpenCV + Pillow + pillow-heif** — auto-crop receipts via contour detection + perspective warp; HEIC support for iPhone photos; EXIF-orientation handling for QR close-ups
+- **zxing-cpp + OpenCV QR detectors (classic + Aruco) + pyzbar** — three independent QR decoders running in parallel; multi-border quiet-zone restoration and blur-triggered unsharp passes for close-up phone shots
+- **RapidOCR + ONNX Runtime** — OCR fallback for the soliq URL itself when no decoder can find the QR
+- **httpx + BeautifulSoup + lxml** — async scraping of soliq.uz / ofd.soliq.uz (header + items + STIR + time)
+- **Playwright (headless Chromium)** — captures a pixel-perfect screenshot of the soliq.uz receipt page at save time; reused across all receipts via a long-running shared browser
+- **qrcode** — generates the per-receipt verification QR embedded in the PDF
 - **openpyxl** — fill the official XLSX template
-- **reportlab** — generate PDF package
+- **reportlab (Platypus + KeepInFrame)** — generate PDF package with one receipt per A4 page
 - **APScheduler** — nightly self-maintenance jobs
 
 ## Self-managed service
 
-V8 runs as a self-maintaining service on the host Mac. No external monitor or cron is required.
+V12 runs as a self-maintaining service on the host Mac. No external monitor or cron is required.
 
 - **Nightly backup** at 03:30 UTC: `mongodump` snapshot under `backups/`, one folder per day. Old snapshots are pruned automatically (the most recent 7 are kept).
 - **Startup catch-up**: if the Mac was asleep at 03:30 and the latest backup is older than 24 h, a backup runs as soon as the bot starts.
@@ -157,16 +161,17 @@ https://ofd.soliq.uz/epul/?t=<terminal_id>&r=<receipt_no>&c=<date>&s=<amount>
 ```
 
 The bot:
-1. Decodes the QR with `zxing-cpp`
+1. Decodes the QR via a multi-decoder pipeline (`zxing-cpp` + OpenCV + Aruco + `pyzbar`)
 2. First tries the structured **JSON endpoint** at `ofd.soliq.uz/check`
-3. Falls back to **HTML scraping** of the consumer-facing receipt page
+3. Falls back to **HTML scraping** of the consumer-facing receipt page, extracting header + line items + STIR + terminal + time
+4. **Captures a headless-Chromium screenshot** of the soliq.uz page (clipped to the totals row, map widget removed) — stored in GridFS as the visual record for the PDF export
 
-This gives the **authoritative** VAT amount straight from the tax authority — far more reliable than OCR.
+This gives the **authoritative** VAT amount straight from the tax authority — far more reliable than OCR — plus a pixel-perfect visual that the tax office can verify by scanning the per-receipt QR in the printed PDF.
 
 ## Notes & limitations
 
 - **Template capacity**: 120 receipts per workbook (30 per sheet × 4 sheets). When receipts span more than one calendar year, `/export_vat` produces one workbook per year, each with its own running totals on the continuation sheets. If a single year exceeds 120 receipts, the year is split into multiple workbooks (`VAT_Refund_2026_copy_1_of_3.xlsx`, `…_copy_2_of_3.xlsx`, `…_copy_3_of_3.xlsx`) with continuous row numbers (1–120, 121–240, …) so the copies read as one document if stapled together.
-- **Online purchases**: `/online_purchase` accepts a soliq.uz URL with no photo. The bot fetches the verified VAT data and renders a clean snapshot PNG (vendor, date, totals, scannable QR) which is stored in GridFS and included in the PDF export, so finance still has a visual record of every entry.
+- **Online purchases**: `/online_purchase` accepts a soliq.uz URL with no photo. The bot fetches the verified VAT data, renders a clean fallback snapshot PNG, and also captures the live soliq.uz page screenshot — both are stored in GridFS so finance has a visual record matching what's on the website.
 - **Duplicate detection**: the same receipt number can't be added twice per user.
 - **soliq.uz availability**: if soliq.uz is down, the bot tells the user and doesn't save a broken record. `/manual` is the fallback when a QR genuinely can't be read.
 - **Privacy**: receipts are stored per Telegram user ID. Only you can see your receipts.

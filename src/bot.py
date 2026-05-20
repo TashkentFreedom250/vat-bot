@@ -1035,6 +1035,109 @@ async def cmd_heartcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(report, parse_mode="HTML")
 
 
+async def _build_savings_report() -> list[str]:
+    """Aggregate the VAT refund totals per user and return one or more
+    Telegram-ready HTML messages. Returns a list of strings so the caller
+    can send each as a separate message (the per-user breakdown can
+    exceed Telegram's 4096-char cap on big user bases).
+    """
+    from datetime import datetime as _dt
+    db_obj = db.get_db()
+    today = _dt.utcnow().strftime("%Y-%m-%d")
+
+    # One pipeline per user: receipts count, sum vat, sum total, date range.
+    pipeline = [
+        {"$group": {
+            "_id": "$telegram_id",
+            "receipts": {"$sum": 1},
+            "vat_sum": {"$sum": {"$ifNull": ["$vat_amount", 0]}},
+            "total_sum": {"$sum": {"$ifNull": ["$total_amount", 0]}},
+            "first_date": {"$min": "$date"},
+            "last_date": {"$max": "$date"},
+            "manual": {"$sum": {"$cond": [{"$eq": ["$manual", True]}, 1, 0]}},
+        }},
+        {"$sort": {"vat_sum": -1}},
+    ]
+    rows = [doc async for doc in db_obj.receipts.aggregate(pipeline)]
+
+    # Pull names for the telegram_ids we saw. One bulk fetch — small set.
+    tids = [r["_id"] for r in rows]
+    name_by_tid: dict[int, str] = {}
+    async for u in db_obj.users.find(
+        {"telegram_id": {"$in": tids}}, {"telegram_id": 1, "name": 1}
+    ):
+        name_by_tid[u["telegram_id"]] = u.get("name") or ""
+
+    grand_vat = sum(float(r["vat_sum"] or 0) for r in rows)
+    grand_total = sum(float(r["total_sum"] or 0) for r in rows)
+    grand_count = sum(int(r["receipts"] or 0) for r in rows)
+
+    header = (
+        f"<b>💰 VAT Savings Report — {today}</b>\n\n"
+        f"<b>Total VAT refundable:</b> {grand_vat:,.2f} UZS\n"
+        f"Across <b>{len(rows)}</b> users • <b>{grand_count}</b> receipts\n"
+        f"Total spend behind it: {grand_total:,.2f} UZS\n\n"
+        "<b>Per-user (biggest savings first)</b>\n"
+    )
+
+    user_lines: list[str] = []
+    for rank, r in enumerate(rows, 1):
+        tid = r["_id"]
+        name = name_by_tid.get(tid) or f"id {tid}"
+        # Escape the name for HTML — display names can contain < or &.
+        from html import escape as _h
+        name_esc = _h(str(name))
+        vat = float(r["vat_sum"] or 0)
+        receipts = int(r["receipts"] or 0)
+        manual = int(r["manual"] or 0)
+        first_d = r.get("first_date") or "—"
+        last_d = r.get("last_date") or "—"
+        manual_note = f" ({manual} manual)" if manual else ""
+        user_lines.append(
+            f"<b>{rank}.</b> {name_esc} — <b>{vat:,.0f} UZS</b>\n"
+            f"   {receipts} receipts{manual_note} • {first_d} → {last_d}"
+        )
+
+    if not user_lines:
+        user_lines.append("<i>No receipts yet.</i>")
+
+    # Pack header + user lines into <= 3800-char chunks (under Telegram's
+    # 4096 cap with headroom for HTML tag overhead).
+    MAX_CHARS = 3800
+    messages: list[str] = []
+    current = header
+    for line in user_lines:
+        addition = "\n" + line
+        if len(current) + len(addition) > MAX_CHARS:
+            messages.append(current)
+            current = "<b>💰 VAT Savings Report (continued)</b>\n" + line
+        else:
+            current += addition
+    if current:
+        messages.append(current)
+    return messages
+
+
+async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Hidden admin-only: per-user VAT savings breakdown across the full
+    receipt history. Silent for non-admins."""
+    uid = update.effective_user.id
+    if uid not in config.ADMIN_TELEGRAM_IDS:
+        return
+    try:
+        messages = await _build_savings_report()
+    except Exception as e:
+        logger.exception("Savings report failed")
+        await update.message.reply_text(
+            f"<b>💰 VAT Savings Report</b>\n\n❌ Failed to build report: "
+            f"{type(e).__name__}: {e}",
+            parse_mode="HTML",
+        )
+        return
+    for msg in messages:
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+
 # ---------- DT-approver commands ----------
 
 async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1921,6 +2024,7 @@ def _build_app() -> Application:
     # Hidden: not in set_my_commands, silent for non-admins. Admin IDs come
     # from the ADMIN_TELEGRAM_IDS env var.
     app.add_handler(CommandHandler("heartcheck", cmd_heartcheck))
+    app.add_handler(CommandHandler("report", cmd_report))
     # DT-approver commands. Silent for non-approvers (APPROVER_TELEGRAM_IDS).
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("approve", cmd_approve))
