@@ -1035,17 +1035,43 @@ async def cmd_heartcheck(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(report, parse_mode="HTML")
 
 
-async def _build_savings_report() -> list[str]:
-    """Aggregate the VAT refund totals per user and return one or more
-    Telegram-ready HTML messages. Returns a list of strings so the caller
-    can send each as a separate message (the per-user breakdown can
-    exceed Telegram's 4096-char cap on big user bases).
+async def _fetch_usd_rate() -> tuple[float, str] | None:
+    """Fetch the official UZS→USD rate from the Central Bank of Uzbekistan.
+    Returns (rate_uzs_per_usd, date_str) or None on failure. CBU updates
+    once per business day; we don't cache because /report is called rarely
+    and a fresh number is more trustworthy than a stale one.
+
+    Endpoint: https://cbu.uz/oz/arkhiv-kursov-valyut/json/USD/
+    Returns a single-element JSON array with the latest USD rate.
     """
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            r = await client.get("https://cbu.uz/oz/arkhiv-kursov-valyut/json/USD/")
+            r.raise_for_status()
+            data = r.json()
+        if not data:
+            return None
+        row = data[0]
+        rate = float(row.get("Rate") or 0)
+        if rate <= 0:
+            return None
+        return rate, str(row.get("Date") or "")
+    except Exception:
+        logger.warning("CBU USD-rate fetch failed", exc_info=True)
+        return None
+
+
+async def _build_savings_report() -> str:
+    """Aggregate VAT refund totals across all users and return a single
+    short Telegram HTML message with the headline numbers in UZS and
+    USD. No per-user breakdown — privacy by design."""
     from datetime import datetime as _dt
     db_obj = db.get_db()
     today = _dt.utcnow().strftime("%Y-%m-%d")
 
-    # One pipeline per user: receipts count, sum vat, sum total, date range.
+    # Single grand-total aggregation. We still group by user only so we
+    # can count distinct users without a second query.
     pipeline = [
         {"$group": {
             "_id": "$telegram_id",
@@ -1054,88 +1080,59 @@ async def _build_savings_report() -> list[str]:
             "total_sum": {"$sum": {"$ifNull": ["$total_amount", 0]}},
             "first_date": {"$min": "$date"},
             "last_date": {"$max": "$date"},
-            "manual": {"$sum": {"$cond": [{"$eq": ["$manual", True]}, 1, 0]}},
         }},
-        {"$sort": {"vat_sum": -1}},
     ]
     rows = [doc async for doc in db_obj.receipts.aggregate(pipeline)]
-
-    # Pull names for the telegram_ids we saw. One bulk fetch — small set.
-    tids = [r["_id"] for r in rows]
-    name_by_tid: dict[int, str] = {}
-    async for u in db_obj.users.find(
-        {"telegram_id": {"$in": tids}}, {"telegram_id": 1, "name": 1}
-    ):
-        name_by_tid[u["telegram_id"]] = u.get("name") or ""
 
     grand_vat = sum(float(r["vat_sum"] or 0) for r in rows)
     grand_total = sum(float(r["total_sum"] or 0) for r in rows)
     grand_count = sum(int(r["receipts"] or 0) for r in rows)
+    user_count = len(rows)
+    first_date = min((r["first_date"] for r in rows if r.get("first_date")), default="—")
+    last_date = max((r["last_date"] for r in rows if r.get("last_date")), default="—")
 
-    header = (
-        f"<b>💰 VAT Savings Report — {today}</b>\n\n"
-        f"<b>Total VAT refundable:</b> {grand_vat:,.2f} UZS\n"
-        f"Across <b>{len(rows)}</b> users • <b>{grand_count}</b> receipts\n"
-        f"Total spend behind it: {grand_total:,.2f} UZS\n\n"
-        "<b>Per-user (biggest savings first)</b>\n"
-    )
-
-    user_lines: list[str] = []
-    for rank, r in enumerate(rows, 1):
-        tid = r["_id"]
-        name = name_by_tid.get(tid) or f"id {tid}"
-        # Escape the name for HTML — display names can contain < or &.
-        from html import escape as _h
-        name_esc = _h(str(name))
-        vat = float(r["vat_sum"] or 0)
-        receipts = int(r["receipts"] or 0)
-        manual = int(r["manual"] or 0)
-        first_d = r.get("first_date") or "—"
-        last_d = r.get("last_date") or "—"
-        manual_note = f" ({manual} manual)" if manual else ""
-        user_lines.append(
-            f"<b>{rank}.</b> {name_esc} — <b>{vat:,.0f} UZS</b>\n"
-            f"   {receipts} receipts{manual_note} • {first_d} → {last_d}"
+    rate_info = await _fetch_usd_rate()
+    if rate_info:
+        rate, rate_date = rate_info
+        vat_usd = grand_vat / rate
+        total_usd = grand_total / rate
+        usd_block = (
+            f"<b>Total VAT refundable:</b> {grand_vat:,.2f} UZS\n"
+            f"                          ≈ <b>${vat_usd:,.2f}</b>\n\n"
+            f"Total spend behind it: {grand_total:,.2f} UZS\n"
+            f"                     ≈ ${total_usd:,.2f}\n\n"
+            f"<i>USD rate: {rate:,.2f} UZS/USD (CBU, {rate_date})</i>"
+        )
+    else:
+        usd_block = (
+            f"<b>Total VAT refundable:</b> {grand_vat:,.2f} UZS\n"
+            f"Total spend behind it: {grand_total:,.2f} UZS\n\n"
+            f"<i>USD conversion unavailable — CBU rate fetch failed.</i>"
         )
 
-    if not user_lines:
-        user_lines.append("<i>No receipts yet.</i>")
-
-    # Pack header + user lines into <= 3800-char chunks (under Telegram's
-    # 4096 cap with headroom for HTML tag overhead).
-    MAX_CHARS = 3800
-    messages: list[str] = []
-    current = header
-    for line in user_lines:
-        addition = "\n" + line
-        if len(current) + len(addition) > MAX_CHARS:
-            messages.append(current)
-            current = "<b>💰 VAT Savings Report (continued)</b>\n" + line
-        else:
-            current += addition
-    if current:
-        messages.append(current)
-    return messages
+    return (
+        f"<b>💰 VAT Savings Report — {today}</b>\n\n"
+        f"{usd_block}\n\n"
+        f"<b>{user_count}</b> users • <b>{grand_count}</b> receipts\n"
+        f"Receipt dates: {first_date} → {last_date}"
+    )
 
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Hidden admin-only: per-user VAT savings breakdown across the full
-    receipt history. Silent for non-admins."""
+    """Hidden admin-only: aggregate VAT savings across the full receipt
+    history, no per-user names. Silent for non-admins."""
     uid = update.effective_user.id
     if uid not in config.ADMIN_TELEGRAM_IDS:
         return
     try:
-        messages = await _build_savings_report()
+        msg = await _build_savings_report()
     except Exception as e:
         logger.exception("Savings report failed")
-        await update.message.reply_text(
+        msg = (
             f"<b>💰 VAT Savings Report</b>\n\n❌ Failed to build report: "
-            f"{type(e).__name__}: {e}",
-            parse_mode="HTML",
+            f"{type(e).__name__}: {e}"
         )
-        return
-    for msg in messages:
-        await update.message.reply_text(msg, parse_mode="HTML")
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 # ---------- DT-approver commands ----------
