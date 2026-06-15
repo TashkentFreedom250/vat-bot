@@ -1065,14 +1065,18 @@ async def _fetch_usd_rate() -> tuple[float, str] | None:
 async def _build_savings_report() -> str:
     """Aggregate VAT refund totals across all users and return a single
     short Telegram HTML message with the headline numbers in UZS and
-    USD. No per-user breakdown — privacy by design."""
+    USD. No per-user breakdown — privacy by design.
+
+    Includes a Lifetime block that sums the active receipts collection
+    with the deleted_receipts_log audit trail (deletions tracked since
+    2026-06-15). Pre-2026-06-15 /reset events were never logged, so the
+    Lifetime number is a floor, not an exact total."""
     from datetime import datetime as _dt
     db_obj = db.get_db()
     today = _dt.utcnow().strftime("%Y-%m-%d")
 
-    # Single grand-total aggregation. We still group by user only so we
-    # can count distinct users without a second query.
-    pipeline = [
+    # Active receipts: group by user for distinct-count and date range.
+    active_pipeline = [
         {"$group": {
             "_id": "$telegram_id",
             "receipts": {"$sum": 1},
@@ -1082,40 +1086,85 @@ async def _build_savings_report() -> str:
             "last_date": {"$max": "$date"},
         }},
     ]
-    rows = [doc async for doc in db_obj.receipts.aggregate(pipeline)]
+    rows = [doc async for doc in db_obj.receipts.aggregate(active_pipeline)]
 
-    grand_vat = sum(float(r["vat_sum"] or 0) for r in rows)
-    grand_total = sum(float(r["total_sum"] or 0) for r in rows)
-    grand_count = sum(int(r["receipts"] or 0) for r in rows)
+    active_vat = sum(float(r["vat_sum"] or 0) for r in rows)
+    active_total = sum(float(r["total_sum"] or 0) for r in rows)
+    active_count = sum(int(r["receipts"] or 0) for r in rows)
     user_count = len(rows)
     first_date = min((r["first_date"] for r in rows if r.get("first_date")), default="—")
     last_date = max((r["last_date"] for r in rows if r.get("last_date")), default="—")
 
+    # Deleted receipts (audit log written by db.delete_all_receipts).
+    del_pipeline = [
+        {"$group": {
+            "_id": None,
+            "count": {"$sum": 1},
+            "vat_sum": {"$sum": {"$ifNull": ["$vat_amount", 0]}},
+            "total_sum": {"$sum": {"$ifNull": ["$total_amount", 0]}},
+        }},
+    ]
+    del_doc = await db_obj.deleted_receipts_log.aggregate(del_pipeline).to_list(1)
+    if del_doc:
+        del_count = int(del_doc[0]["count"] or 0)
+        del_vat = float(del_doc[0]["vat_sum"] or 0)
+        del_total = float(del_doc[0]["total_sum"] or 0)
+    else:
+        del_count = 0
+        del_vat = 0.0
+        del_total = 0.0
+
+    lifetime_vat = active_vat + del_vat
+    lifetime_total = active_total + del_total
+    lifetime_count = active_count + del_count
+
     rate_info = await _fetch_usd_rate()
     if rate_info:
         rate, rate_date = rate_info
-        vat_usd = grand_vat / rate
-        total_usd = grand_total / rate
-        usd_block = (
-            f"<b>Total VAT refundable:</b> {grand_vat:,.2f} UZS\n"
-            f"                          ≈ <b>${vat_usd:,.2f}</b>\n\n"
-            f"Total spend behind it: {grand_total:,.2f} UZS\n"
-            f"                     ≈ ${total_usd:,.2f}\n\n"
-            f"<i>USD rate: {rate:,.2f} UZS/USD (CBU, {rate_date})</i>"
+        def usd(x: float) -> str:
+            return f"${x / rate:,.2f}"
+        rate_note = f"<i>USD rate: {rate:,.2f} UZS/USD (CBU, {rate_date})</i>"
+    else:
+        def usd(_: float) -> str:
+            return "—"
+        rate_note = "<i>USD conversion unavailable — CBU rate fetch failed.</i>"
+
+    active_block = (
+        f"<b>Active</b>\n"
+        f"VAT refundable: {active_vat:,.2f} UZS  ≈ <b>{usd(active_vat)}</b>\n"
+        f"Spend:          {active_total:,.2f} UZS  ≈ {usd(active_total)}\n"
+        f"{active_count} receipts across {user_count} users"
+    )
+    if del_count:
+        deleted_block = (
+            f"<b>Deleted via /reset</b>\n"
+            f"VAT lost:       {del_vat:,.2f} UZS  ≈ {usd(del_vat)}\n"
+            f"Spend lost:     {del_total:,.2f} UZS  ≈ {usd(del_total)}\n"
+            f"{del_count} receipts"
+        )
+        lifetime_block = (
+            f"<b>Lifetime processed (active + deleted)</b>\n"
+            f"VAT:            {lifetime_vat:,.2f} UZS  ≈ <b>{usd(lifetime_vat)}</b>\n"
+            f"Spend:          {lifetime_total:,.2f} UZS  ≈ {usd(lifetime_total)}\n"
+            f"{lifetime_count} receipts"
         )
     else:
-        usd_block = (
-            f"<b>Total VAT refundable:</b> {grand_vat:,.2f} UZS\n"
-            f"Total spend behind it: {grand_total:,.2f} UZS\n\n"
-            f"<i>USD conversion unavailable — CBU rate fetch failed.</i>"
+        deleted_block = (
+            f"<b>Deleted via /reset</b>\n"
+            f"<i>None logged yet. Audit logging started 2026-06-15.</i>"
         )
+        lifetime_block = ""
 
-    return (
-        f"<b>💰 VAT Savings Report — {today}</b>\n\n"
-        f"{usd_block}\n\n"
-        f"<b>{user_count}</b> users • <b>{grand_count}</b> receipts\n"
-        f"Receipt dates: {first_date} → {last_date}"
-    )
+    sections = [
+        f"<b>💰 VAT Savings Report — {today}</b>",
+        active_block,
+        deleted_block,
+    ]
+    if lifetime_block:
+        sections.append(lifetime_block)
+    sections.append(f"Receipt dates: {first_date} → {last_date}")
+    sections.append(rate_note)
+    return "\n\n".join(sections)
 
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:

@@ -83,6 +83,10 @@ async def ensure_indexes() -> None:
     )
     await db.pending_receipts.create_index("telegram_id", unique=True)
     await db.pending_receipts.create_index("expires_at", expireAfterSeconds=0)
+    # Audit trail for /reset deletions. Queried by /report for
+    # lifetime-processed totals — indexes match that access pattern.
+    await db.deleted_receipts_log.create_index([("deleted_at", -1)])
+    await db.deleted_receipts_log.create_index("telegram_id")
 
 
 async def migrate_legacy_users_to_approved() -> int:
@@ -333,13 +337,45 @@ async def count_receipts(telegram_id: int) -> int:
 
 
 async def delete_all_receipts(telegram_id: int) -> int:
-    """Delete all of a user's receipts AND their GridFS images. Returns count."""
+    """Delete all of a user's receipts AND their GridFS images. Returns count.
+
+    Before purging, write each receipt's accounting fields to
+    `deleted_receipts_log` so historical totals (/report) can still
+    include amounts a user removed via /reset. Only metadata is kept —
+    no image bytes, no soliq URL — keeping the log small and avoiding
+    any re-identification risk."""
     from bson import ObjectId
     db = get_db()
     fs = get_fs()
     receipts = await list_receipts(telegram_id)
+
+    now = datetime.utcnow()
+    log_docs = []
     for r in receipts:
-        for field in ("image_file_id", "qr_image_file_id"):
+        log_docs.append({
+            "telegram_id": telegram_id,
+            "original_id": r.get("_id"),
+            "receipt_number": r.get("receipt_number", ""),
+            "date": r.get("date", ""),
+            "vat_amount": float(r.get("vat_amount") or 0),
+            "total_amount": float(r.get("total_amount") or 0),
+            "manual": bool(r.get("manual")),
+            "online_purchase": bool(r.get("online_purchase")),
+            "created_at": r.get("created_at"),
+            "deleted_at": now,
+        })
+    if log_docs:
+        try:
+            await db.deleted_receipts_log.insert_many(log_docs)
+        except Exception:
+            # Audit log is best-effort — never let it block a /reset.
+            pass
+
+    for r in receipts:
+        # Drop EVERY image file the receipt references. Missing any one
+        # field (as the original code did with soliq_screenshot_file_id)
+        # leaks GridFS blobs and inflates disk usage forever.
+        for field in ("image_file_id", "qr_image_file_id", "soliq_screenshot_file_id"):
             fid = r.get(field)
             if fid:
                 try:
@@ -364,8 +400,16 @@ async def cleanup_orphaned_images() -> int:
     fs = get_fs()
     referenced: set[ObjectId] = set()
 
-    async for rec in db.receipts.find({}, {"image_file_id": 1, "qr_image_file_id": 1}):
-        for field in ("image_file_id", "qr_image_file_id"):
+    async for rec in db.receipts.find(
+        {},
+        {"image_file_id": 1, "qr_image_file_id": 1, "soliq_screenshot_file_id": 1},
+    ):
+        # All THREE image file ids a receipt can carry. Forgetting any
+        # one of these makes the nightly cleanup treat valid blobs as
+        # orphans — that bug deleted every soliq.uz screenshot saved
+        # before 2026-05-20 startup (V.10 added the field but this
+        # query didn't).
+        for field in ("image_file_id", "qr_image_file_id", "soliq_screenshot_file_id"):
             file_id = rec.get(field)
             if not file_id:
                 continue
