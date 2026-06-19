@@ -19,6 +19,7 @@ from html import escape
 import logging
 import logging.handlers
 import os
+import signal
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -2084,26 +2085,76 @@ def _build_app() -> Application:
     return app
 
 
+# Flipped to True only when SIGINT/SIGTERM hits our handler (Ctrl-C,
+# `launchctl kill SIGTERM`, system shutdown). Used to distinguish
+# "user wants the process to quit" from "python-telegram-bot's library
+# swallowed a network error and stopped polling cleanly" — the two
+# look identical to run_polling()'s return value but require opposite
+# responses from main(). Pre-2026-06-19 we treated both as quit, so a
+# 13-hour overnight WiFi outage caused the process to exit when
+# Telegram came back and launchd had to restart it.
+_USER_REQUESTED_SHUTDOWN = False
+
+
+def _handle_shutdown_signal(signum, _frame):
+    """Set the shutdown flag and re-raise as KeyboardInterrupt so
+    run_polling unwinds cleanly. We install this BEFORE run_polling
+    starts; passing stop_signals=None to run_polling disables its own
+    handlers so this one wins."""
+    global _USER_REQUESTED_SHUTDOWN
+    _USER_REQUESTED_SHUTDOWN = True
+    logger.info("Received signal %s — shutting down.", signum)
+    raise KeyboardInterrupt
+
+
 def main() -> None:
     logger.info("Starting VAT bot (local Mac host).")
-    # Auto-restart loop: if WiFi drops long enough to break polling, rebuild
-    # the Application and resume. Exponential backoff caps at 60s so we don't
-    # hammer the network while it's down.
+    # Install our own signal handlers BEFORE the library can install
+    # its own. Without this, a SIGTERM from launchd would unwind via
+    # python-telegram-bot's internal handler and we'd never know
+    # whether the resulting clean-shutdown was user-driven or a
+    # library-swallowed network error.
+    signal.signal(signal.SIGINT, _handle_shutdown_signal)
+    signal.signal(signal.SIGTERM, _handle_shutdown_signal)
+
+    # Auto-restart loop: any non-user-signal exit (clean OR crashed)
+    # is treated as a transient network blip and triggers an in-process
+    # rebuild. Exponential backoff caps at 60 s.
     backoff = 5
     while True:
         app = _build_app()
         logger.info("Bot polling...")
         try:
-            app.run_polling(allowed_updates=Update.ALL_TYPES)
-            logger.info("Polling exited cleanly. Shutting down.")
-            return
+            # stop_signals=None disables the library's SIGINT/SIGTERM
+            # handlers so our _handle_shutdown_signal stays authoritative.
+            app.run_polling(
+                allowed_updates=Update.ALL_TYPES, stop_signals=None
+            )
         except (KeyboardInterrupt, SystemExit):
-            logger.info("Bot stopped by user.")
+            logger.info("Bot stopped by user signal.")
             return
         except Exception:
             logger.exception("Polling crashed — restarting in %ss.", backoff)
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
+            continue
+
+        # run_polling returned normally with no exception. If the user
+        # actually signalled shutdown, our handler set the flag (and
+        # would have raised KeyboardInterrupt, hitting the except
+        # above). If we're here without the flag, the python-telegram-bot
+        # library suppressed a network error and stopped polling on its
+        # own — restart in-process rather than letting launchd reap us.
+        if _USER_REQUESTED_SHUTDOWN:
+            logger.info("Polling exited after shutdown signal. Goodbye.")
+            return
+        logger.warning(
+            "Polling exited cleanly with no user signal — library "
+            "swallowed a network error. Restarting in %ss.",
+            backoff,
+        )
+        time.sleep(backoff)
+        backoff = min(backoff * 2, 60)
 
 
 if __name__ == "__main__":
