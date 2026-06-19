@@ -79,7 +79,17 @@ if [ -n "$LAUNCHD_MARKER" ]; then
   ensure_dependencies
   # shellcheck disable=SC1091
   source .venv/bin/activate
-  exec python -m src.bot
+  # Wrap the Python process in caffeinate so the Mac doesn't idle-sleep
+  # (or display-sleep, or disk-sleep) while the bot is running. caffeinate
+  # holds the assertion as long as the bot process is alive; the moment
+  # the bot exits, caffeinate exits too and the Mac is free to sleep
+  # normally. No dependency on GUI apps like KeepingYouAwake — sleep
+  # prevention is tied directly to the launchd-managed bot lifetime.
+  #   -i  prevent idle sleep
+  #   -m  prevent disk sleep
+  #   -s  prevent system sleep on AC
+  #   -u  declare user activity (works even when not on AC)
+  exec /usr/bin/caffeinate -imsu python -m src.bot
 fi
 
 # ======================================================================
