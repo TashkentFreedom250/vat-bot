@@ -45,10 +45,35 @@ async def fetch_receipt_data(qr_url: str) -> Optional[dict]:
 
 
 async def fetch_receipt_with_diag(qr_url: str) -> tuple[Optional[dict], str]:
-    """Like fetch_receipt_data but also returns a human-readable failure reason."""
+    """Like fetch_receipt_data but also returns a human-readable failure reason.
+
+    Since June 2026 the primary strategy is a browser-based fetch (soliq
+    switched their site to a client-side React SPA — the old /check URL
+    now returns an empty shell, and the receipt data only exists after
+    the SPA calls new-ofd.soliq.uz/api/payment with a signed X-Signature
+    header we can't reproduce). We drive a headless Chromium (shared
+    with the PDF screenshot module) and intercept the API response.
+    The httpx-based path is retained only as a defensive fallback.
+    """
     if not qr_url:
         return None, "Empty QR URL."
 
+    # --- Primary: intercept the SPA's API response via shared browser --
+    try:
+        from . import soliq_screenshot
+        # capture() returns (screenshot_png, api_data) — we only want the
+        # data here. The screenshot is cached implicitly by the caller
+        # calling capture() again later if needed. TODO: unify the two
+        # trips so we only navigate once per receipt.
+        _png, api_data = await soliq_screenshot.capture(qr_url)
+        if api_data:
+            normalized = _normalize_new_api(api_data, qr_url)
+            if normalized:
+                return normalized, "ok"
+    except Exception:
+        logger.exception("Browser-based soliq fetch failed for %s", qr_url)
+
+    # --- Fallback: httpx (works only on legacy soliq endpoints) --------
     try:
         qs = parse_qs(urlparse(qr_url).query)
     except Exception:
@@ -149,6 +174,111 @@ async def fetch_receipt_with_diag(qr_url: str) -> tuple[Optional[dict], str]:
     else:
         diag = "All soliq.uz attempts failed for an unknown reason."
     return None, diag
+
+
+def _normalize_new_api(data: dict, qr_url: str) -> Optional[dict]:
+    """Map the new-ofd.soliq.uz/api/payment response into our internal
+    receipt dict shape. The API returns everything under a top-level
+    "data" key; caller should pass the outer dict — we handle both
+    shapes (with and without the wrapper) for safety.
+
+    Field mapping (verified from a live 2026-07-01 response):
+      data.paymentDate         "DD.MM.YYYY HH:MM:SS"  → date, meta.time
+      data.paymentNo           → receipt_number
+      data.vatTotal            → vat_amount
+      data.cashTotal + cardTotal → total_amount
+      data.extraInfo.companyName → vendor
+      data.extraInfo.address   → meta.address
+      data.tin                 → meta.stir
+      data.terminalId          → meta.terminal
+      data.paymentDetails[]    → items[{name, qty, price, vat, total}]
+    """
+    if not isinstance(data, dict):
+        return None
+    payload = data.get("data") if isinstance(data.get("data"), dict) else data
+    if not isinstance(payload, dict):
+        return None
+
+    extra = payload.get("extraInfo") or {}
+
+    vendor = extra.get("companyName") or ""
+    vat = _to_float(payload.get("vatTotal"))
+    total = _to_float(payload.get("cardTotal")) + _to_float(payload.get("cashTotal"))
+    receipt_no = str(payload.get("paymentNo") or "").strip()
+    terminal_id = str(payload.get("terminalId") or "").strip()
+    stir = str(payload.get("tin") or "").strip() or None
+
+    # paymentDate: "15.03.2026 13:04:55" → date "2026-03-15", time "13:04"
+    date_str = ""
+    time_str = ""
+    raw_date = payload.get("paymentDate") or payload.get("created") or ""
+    if raw_date:
+        try:
+            dt_part, _, tm_part = str(raw_date).partition(" ")
+            if dt_part:
+                dd, mm, yyyy = dt_part.split(".")
+                date_str = datetime(int(yyyy), int(mm), int(dd)).strftime("%Y-%m-%d")
+            if tm_part:
+                time_str = tm_part[:5]  # HH:MM
+        except Exception:
+            date_str = _date_from_qr_param(qr_url)
+
+    if not date_str:
+        date_str = _date_from_qr_param(qr_url)
+
+    items = _items_from_new_api(payload.get("paymentDetails") or [])
+
+    meta = {
+        "address": extra.get("address") or "",
+        "stir": stir or "",
+        "terminal": terminal_id,
+        "time": time_str,
+    }
+    if not meta["address"]:
+        del meta["address"]
+    if not meta["stir"]:
+        del meta["stir"]
+
+    if not vendor and not vat and not total:
+        return None
+
+    return {
+        "vendor": str(vendor).strip() or "Unknown vendor",
+        "date": date_str,
+        "receipt_number": receipt_no,
+        "vat_amount": vat,
+        "total_amount": total,
+        "items": items,
+        "meta": {k: str(v) for k, v in meta.items() if v},
+        "raw": {"source": "new-ofd-api", "terminal": terminal_id},
+    }
+
+
+def _items_from_new_api(details: list) -> list[dict]:
+    """Turn paymentDetails[] from the SPA API into our items[] shape."""
+    if not isinstance(details, list):
+        return []
+    out: list[dict] = []
+    for it in details:
+        if not isinstance(it, dict):
+            continue
+        name = it.get("name") or it.get("productName") or ""
+        qty = _to_float(it.get("amount") or 0)
+        # price is per-unit; the API stores it in kopecks / integer
+        # UZS. All observed responses so far use whole UZS (e.g. 53000).
+        price = _to_float(it.get("price") or 0)
+        vat = _to_float(it.get("vat") or 0)
+        line_total = qty * price if qty and price else _to_float(it.get("goodPrice"))
+        if not name and price == 0 and vat == 0:
+            continue
+        out.append({
+            "name": str(name).strip(),
+            "qty": qty,
+            "price": price,
+            "total": line_total,
+            "vat": vat,
+        })
+    return out
 
 
 def _normalize_json(data: dict, terminal: str, receipt: str) -> Optional[dict]:

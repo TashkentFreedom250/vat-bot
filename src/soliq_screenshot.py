@@ -73,20 +73,27 @@ async def shutdown() -> None:
     _browser = None
 
 
-async def capture(url: str) -> Optional[bytes]:
-    """Render the URL and return a JPEG screenshot of the receipt block.
+# API endpoint soliq's SPA calls at runtime — we intercept the response
+# here to recover receipt data instead of parsing HTML that no longer
+# exists (their site switched to a React SPA in June 2026; the /check
+# URL now returns just an empty <div id="root"></div>).
+_API_URL_FRAGMENT = "new-ofd.soliq.uz/api/payment"
 
-    Returns None on any failure — the caller treats a missing screenshot
-    as "fall back to the soliq-data renderer" rather than failing the
-    whole save flow. We never want a screenshot hiccup to drop a
-    receipt the user took the trouble to photograph.
+
+async def capture(url: str) -> tuple[Optional[bytes], Optional[dict]]:
+    """Render the URL, intercept soliq's JSON API response, and take a
+    JPEG screenshot of the rendered receipt block. Returns
+    (png_bytes or None, api_data or None). Both are best-effort — a
+    missing screenshot falls back to the data renderer, and missing
+    API data is handled by the caller (which used to rely on HTML
+    scraping and no longer works).
     """
     if _browser is None:
-        # Lazy startup — the bot may not have called startup() (e.g. CLI
-        # usage). Best effort: try to launch now.
         await startup()
         if _browser is None:
-            return None
+            return None, None
+
+    api_data: dict[str, dict] = {}
 
     try:
         async with _lock:
@@ -96,49 +103,67 @@ async def capture(url: str) -> Optional[bytes]:
                 ignore_https_errors=True,
             )
             page = await context.new_page()
-            try:
-                await page.goto(url, wait_until="domcontentloaded",
-                                timeout=_NAV_TIMEOUT_MS)
-                # Wait for the receipt table to render — the page is
-                # hydrated by JS after DOMContentLoaded.
-                try:
-                    await page.wait_for_selector("table", timeout=8000)
-                except Exception:
-                    pass
 
-                # Find the receipt content's bounding box. We clip from
-                # the top of the .ticket-wrap div (skipping the SOLIQ
-                # mobile-app banner that wastes the top ~110 px) down
-                # to the bottom of the last totals row (skipping the
-                # Yandex map injected at the bottom of ticket-wrap).
+            # Intercept the SPA's XHR. Playwright's response event fires
+            # once the browser gets a full body — perfect timing to
+            # cache the JSON without slowing anything down.
+            async def _capture_response(resp):
+                if _API_URL_FRAGMENT not in resp.url:
+                    return
+                try:
+                    if resp.status == 200:
+                        payload = await resp.json()
+                        if isinstance(payload, dict):
+                            api_data["value"] = payload
+                except Exception:
+                    logger.debug("Failed to read /api/payment body", exc_info=True)
+
+            page.on("response", lambda r: asyncio.create_task(_capture_response(r)))
+
+            try:
+                # networkidle so the SPA's XHR completes before we
+                # screenshot. domcontentloaded fires before the API
+                # call and would give us a blank React shell.
+                await page.goto(url, wait_until="networkidle",
+                                timeout=_NAV_TIMEOUT_MS)
+                # Small buffer in case the response handler is still
+                # awaiting body() when goto returns.
+                await page.wait_for_timeout(400)
+
+                # Find the receipt content's bounding box for a tight
+                # screenshot. The SPA renders inside a #root element;
+                # we look for the biggest child inside root that
+                # contains the totals row and clip to its bounds. If
+                # that fails, we take the full page (the whole SPA
+                # viewport is receipt content — no header banner).
                 bounds = await page.evaluate("""
                     () => {
-                        const wrap = document.querySelector(".ticket-wrap")
-                                 || document.querySelector("main")
-                                 || document.body;
-                        const wrapTop = wrap
-                            ? (wrap.getBoundingClientRect().top + window.scrollY)
-                            : 0;
-                        const labels = ["jami to", "umumiy qqs", "umumiy q", "итого"];
-                        const all = Array.from(document.querySelectorAll("body *"));
+                        const root = document.querySelector("#root");
+                        if (!root) return { top: 0, bottom: 0 };
+                        const rootRect = root.getBoundingClientRect();
+                        // Look for the totals row (Jami / Umumiy / Итого)
+                        // among leaf-ish elements. Same approach we used
+                        // for the old server-rendered layout.
+                        const labels = ["jami to", "umumiy qqs", "umumiy q",
+                                        "итого", "total", "vat"];
+                        const all = Array.from(root.querySelectorAll("*"));
                         let bottom = 0;
                         for (const el of all) {
                             const direct = (el.textContent || "").trim().toLowerCase();
                             if (!direct) continue;
                             if (!labels.some(l => direct.startsWith(l))) continue;
-                            // Skip wrapping containers — we want the row.
                             if (el.childElementCount > 8) continue;
                             const rect = el.getBoundingClientRect();
                             const elBottom = rect.bottom + window.scrollY;
                             if (elBottom > bottom) bottom = elBottom;
                         }
-                        return { top: wrapTop, bottom: bottom };
+                        return {
+                            top: rootRect.top + window.scrollY,
+                            bottom: bottom,
+                        };
                     }
                 """)
 
-                # full_page=True is required for clip to reach below the
-                # viewport fold. Without it Playwright clamps clip to
-                # viewport height and the totals row gets chopped.
                 screenshot_kwargs = {
                     "type": "jpeg",
                     "quality": 85,
@@ -147,8 +172,6 @@ async def capture(url: str) -> Optional[bytes]:
                 top = max(0, int(bounds.get("top") or 0))
                 bottom = int(bounds.get("bottom") or 0)
                 if bottom > top + 200:
-                    # Pad 25 px below the totals row so sub-pixel rounding
-                    # doesn't shave the bottom border off.
                     screenshot_kwargs["clip"] = {
                         "x": 0,
                         "y": top,
@@ -157,9 +180,9 @@ async def capture(url: str) -> Optional[bytes]:
                     }
 
                 png = await page.screenshot(**screenshot_kwargs)
-                return png
+                return png, api_data.get("value")
             finally:
                 await context.close()
     except Exception:
-        logger.exception("soliq screenshot capture failed for %s", url)
-        return None
+        logger.exception("soliq page capture failed for %s", url)
+        return None, api_data.get("value")

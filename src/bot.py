@@ -281,7 +281,43 @@ async def _save_verified_receipt(
     loop: asyncio.AbstractEventLoop,
     qr_image_bytes: bytes | None = None,
 ) -> tuple[str, bool]:
-    data, diag = await soliq.fetch_receipt_with_diag(qr_url)
+    # Kick off both the browser trip (renders soliq.uz, intercepts the
+    # SPA's API response, takes a screenshot — all in one trip) AND the
+    # printed-vendor OCR in parallel. The browser trip is now the
+    # primary source of receipt data (soliq switched to a SPA in June
+    # 2026); one trip gets us the JSON payload and the screenshot at
+    # the same time so users don't wait for two sequential nav cycles.
+    printed_vendor_task = loop.run_in_executor(
+        None, receipt_ocr.extract_printed_vendor, source_image_bytes
+    )
+    capture_task = soliq_screenshot.capture(qr_url)
+    printed_vendor_result, capture_result = await asyncio.gather(
+        printed_vendor_task, capture_task, return_exceptions=True
+    )
+    if isinstance(printed_vendor_result, BaseException):
+        logger.exception("Printed vendor OCR failed", exc_info=printed_vendor_result)
+        printed_vendor = None
+    else:
+        printed_vendor = printed_vendor_result
+
+    screenshot_bytes: bytes | None = None
+    api_data: dict | None = None
+    if isinstance(capture_result, BaseException):
+        logger.exception("soliq page capture raised", exc_info=capture_result)
+    elif capture_result:
+        screenshot_bytes, api_data = capture_result
+
+    # Turn the browser-intercepted JSON into our internal receipt dict.
+    # If the intercept missed (network blip, timeout), fall back to
+    # httpx via fetch_receipt_with_diag (which now also has a browser
+    # retry inside it — this is the last-ditch path).
+    data: dict | None = None
+    diag = "ok"
+    if api_data:
+        data = soliq._normalize_new_api(api_data, qr_url)
+    if data is None:
+        data, diag = await soliq.fetch_receipt_with_diag(qr_url)
+
     if not data:
         return (
             f"I read the QR code but could not fetch data from soliq.uz.\n\n"
@@ -298,26 +334,6 @@ async def _save_verified_receipt(
             "It will not be added to your records.",
             False,
         )
-
-    # Run printed-vendor OCR and the soliq.uz page screenshot in parallel.
-    # Both take ~1-2 s; sequencing them would double the user-visible save
-    # delay. The screenshot is the visual record we embed in the export
-    # PDF — failure here is non-fatal (we fall back to the data renderer).
-    printed_vendor_task = loop.run_in_executor(
-        None, receipt_ocr.extract_printed_vendor, source_image_bytes
-    )
-    screenshot_task = soliq_screenshot.capture(qr_url)
-    printed_vendor_result, screenshot_bytes = await asyncio.gather(
-        printed_vendor_task, screenshot_task, return_exceptions=True
-    )
-    if isinstance(printed_vendor_result, BaseException):
-        logger.exception("Printed vendor OCR failed", exc_info=printed_vendor_result)
-        printed_vendor = None
-    else:
-        printed_vendor = printed_vendor_result
-    if isinstance(screenshot_bytes, BaseException):
-        logger.exception("soliq screenshot capture raised", exc_info=screenshot_bytes)
-        screenshot_bytes = None
 
     display_vendor = data.get("vendor", "") or printed_vendor or ""
     file_id = await db.save_image(uid, source_image_bytes, f"receipt_{uid}.png")
@@ -1434,9 +1450,11 @@ async def _save_online_purchase(
         file_id = None
 
     # Capture the soliq.uz page for the PDF export. Non-fatal on failure.
+    # capture() returns (png, api_data); the api_data was already used
+    # upstream via fetch_receipt_with_diag → we discard it here.
     screenshot_file_id = None
     try:
-        screenshot_bytes = await soliq_screenshot.capture(qr_url)
+        screenshot_bytes, _ = await soliq_screenshot.capture(qr_url)
         if screenshot_bytes:
             screenshot_file_id = await db.save_image(
                 uid, screenshot_bytes, f"soliq_{uid}.jpg"
