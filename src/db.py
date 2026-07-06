@@ -14,9 +14,11 @@ Collections:
     }
 """
 import asyncio
+import logging
 from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Optional
+from urllib.parse import parse_qs, urlparse
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorGridFSBucket
 from PIL import Image
@@ -25,6 +27,48 @@ from pillow_heif import register_heif_opener
 from . import config
 
 register_heif_opener()
+
+logger = logging.getLogger("vat_bot.db")
+
+
+class DuplicateClaimError(Exception):
+    """Raised when a receipt's fiscal identity is already claimed by a
+    DIFFERENT user. The same physical receipt must never be refunded
+    twice, so the caller rejects the save and alerts the admins."""
+
+    def __init__(self, fiscal_id: str, existing_telegram_id: int, new_telegram_id: int):
+        self.fiscal_id = fiscal_id
+        self.existing_telegram_id = existing_telegram_id
+        self.new_telegram_id = new_telegram_id
+        super().__init__(
+            f"fiscal receipt {fiscal_id} already claimed by user "
+            f"{existing_telegram_id}; rejected for user {new_telegram_id}"
+        )
+
+
+def fiscal_id_from_url(url: str) -> Optional[str]:
+    """Canonical GLOBAL identity of a fiscal receipt.
+
+    Built from the QR query string: terminal id (t), per-terminal receipt
+    counter (r), fiscal timestamp (c), fiscal sign (s). A bare
+    receipt_number is NOT globally unique — every cash terminal runs its
+    own counter — so cross-user duplicate detection keys on this tuple.
+    Parsing the params (rather than hashing the raw URL) means the same
+    receipt reached via different soliq path variants (/check, /epi,
+    /epul) still maps to one identity."""
+    if not url:
+        return None
+    try:
+        qs = parse_qs(urlparse(url).query)
+        t = (qs.get("t") or [None])[0]
+        r = (qs.get("r") or [None])[0]
+        c = (qs.get("c") or [None])[0] or ""
+        s = (qs.get("s") or [None])[0] or ""
+        if t and r:
+            return f"{t}:{r}:{c}:{s}"
+    except Exception:
+        pass
+    return None
 
 # JPEG quality used when storing receipt images in GridFS. 85 is visually
 # indistinguishable from the original for receipt photos and drops storage
@@ -87,6 +131,59 @@ async def ensure_indexes() -> None:
     # lifetime-processed totals — indexes match that access pattern.
     await db.deleted_receipts_log.create_index([("deleted_at", -1)])
     await db.deleted_receipts_log.create_index("telegram_id")
+    # GLOBAL uniqueness of the fiscal receipt identity — the hard
+    # guarantee that no two users can claim the same physical receipt.
+    # sparse: manual entries have no QR and therefore no fiscal_id.
+    # If historical cross-user duplicates predate this index, creation
+    # fails; fall back to a non-unique index (fast lookups for the
+    # app-level check in save_receipt) and log loudly. Once the human
+    # resolves the old duplicates, the next restart upgrades to unique
+    # automatically.
+    try:
+        await db.receipts.create_index(
+            "fiscal_id", unique=True, sparse=True, name="fiscal_id_unique"
+        )
+        try:
+            await db.receipts.drop_index("fiscal_id_lookup")
+        except Exception:
+            pass  # lookup index only exists if we previously fell back
+    except Exception:
+        logger.warning(
+            "Could not create UNIQUE fiscal_id index — pre-existing "
+            "cross-user duplicate claims in the receipts collection. "
+            "Falling back to non-unique index; save_receipt's app-level "
+            "check still blocks new double-claims. Resolve the old "
+            "duplicates and restart to upgrade."
+        )
+        await db.receipts.create_index("fiscal_id", name="fiscal_id_lookup")
+
+
+async def migrate_backfill_fiscal_ids() -> int:
+    """One-time (idempotent) backfill: compute fiscal_id for receipts
+    saved before cross-user duplicate detection existed. Returns the
+    number of receipts updated. Runs on every startup; after the first
+    pass the $exists filter matches nothing and this is a no-op."""
+    db = get_db()
+    updated = 0
+    async for r in db.receipts.find(
+        {"fiscal_id": {"$exists": False}}, {"soliq_url": 1, "raw_qr": 1}
+    ):
+        fid = fiscal_id_from_url(r.get("soliq_url") or r.get("raw_qr") or "")
+        if not fid:
+            continue  # manual entry — no QR, nothing to key on
+        try:
+            await db.receipts.update_one(
+                {"_id": r["_id"]}, {"$set": {"fiscal_id": fid}}
+            )
+            updated += 1
+        except Exception:
+            # Unique index already live and this row collides with an
+            # earlier claim — leave it without fiscal_id and surface it.
+            logger.warning(
+                "fiscal_id backfill collision for receipt %s (fiscal %s)",
+                r["_id"], fid,
+            )
+    return updated
 
 
 async def migrate_legacy_users_to_approved() -> int:
@@ -300,15 +397,48 @@ async def detach_pending_receipt(telegram_id: int) -> int:
 
 
 async def save_receipt(doc: dict) -> Optional[str]:
-    """Insert a receipt. Returns inserted id, or None if duplicate receipt_number."""
+    """Insert a receipt. Returns inserted id, or None when the SAME user
+    already has this receipt saved.
+
+    Raises DuplicateClaimError when a DIFFERENT user has already claimed
+    the same fiscal receipt (matched on the QR's terminal/receipt#/
+    timestamp/fiscal-sign tuple). The tax office refunds each fiscal
+    receipt at most once, so a second claim — e.g. two colleagues
+    photographing the same lunch receipt — must be rejected loudly, not
+    silently deduped."""
     db = get_db()
     doc = {**doc, "created_at": datetime.utcnow()}
+
+    fid = fiscal_id_from_url(doc.get("soliq_url") or doc.get("raw_qr") or "")
+    if fid:
+        doc["fiscal_id"] = fid
+        existing = await db.receipts.find_one(
+            {"fiscal_id": fid}, {"telegram_id": 1}
+        )
+        if existing:
+            if existing.get("telegram_id") != doc.get("telegram_id"):
+                raise DuplicateClaimError(
+                    fid, existing.get("telegram_id"), doc.get("telegram_id")
+                )
+            return None  # same user re-scanning their own receipt
+
     try:
         result = await db.receipts.insert_one(doc)
         return str(result.inserted_id)
     except Exception as e:
-        # Likely duplicate key on (telegram_id, receipt_number)
-        if "duplicate key" in str(e).lower():
+        # Duplicate key on (telegram_id, receipt_number) — manual entries
+        # have no fiscal_id, so this per-user index is their only guard —
+        # or on fiscal_id_unique if two saves raced past the find_one.
+        msg = str(e).lower()
+        if "duplicate key" in msg:
+            if fid and "fiscal_id" in msg:
+                other = await db.receipts.find_one(
+                    {"fiscal_id": fid}, {"telegram_id": 1}
+                )
+                if other and other.get("telegram_id") != doc.get("telegram_id"):
+                    raise DuplicateClaimError(
+                        fid, other.get("telegram_id"), doc.get("telegram_id")
+                    ) from e
             return None
         raise
 
@@ -355,6 +485,7 @@ async def delete_all_receipts(telegram_id: int) -> int:
         log_docs.append({
             "telegram_id": telegram_id,
             "original_id": r.get("_id"),
+            "fiscal_id": r.get("fiscal_id"),
             "receipt_number": r.get("receipt_number", ""),
             "date": r.get("date", ""),
             "vat_amount": float(r.get("vat_amount") or 0),

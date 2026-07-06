@@ -90,6 +90,24 @@ SAVE_DEBUG_IMAGES = os.getenv("SAVE_DEBUG_IMAGES", "").lower() in {"1", "true", 
 # hidden /heartcheck admin command. Set at import (i.e. process start).
 _PROCESS_START_TS = time.time()
 
+# Reference to the running Application's Bot, set in _post_init. Lets
+# deep helpers (e.g. the double-claim rejection path in
+# _save_verified_receipt, which has no ctx) proactively DM the admins.
+_APP_BOT = None
+
+
+async def _notify_admins(text: str) -> None:
+    """Best-effort Telegram DM to every ADMIN_TELEGRAM_IDS entry. Never
+    raises — an unreachable admin must not break receipt processing."""
+    if _APP_BOT is None:
+        logger.warning("Admin notify skipped (bot not started yet): %s", text)
+        return
+    for admin_id in config.ADMIN_TELEGRAM_IDS:
+        try:
+            await _APP_BOT.send_message(admin_id, text, parse_mode="HTML")
+        except Exception:
+            logger.warning("Could not DM admin %s", admin_id, exc_info=True)
+
 # Image processing (OpenCV, zxing, PIL) releases the GIL — use all cores
 _executor = ThreadPoolExecutor(
     max_workers=(os.cpu_count() or 4) * 2,
@@ -371,7 +389,25 @@ async def _save_verified_receipt(
         "soliq_items": data.get("items") or [],
         "soliq_meta": data.get("meta") or {},
     }
-    inserted = await db.save_receipt(receipt_doc)
+    try:
+        inserted = await db.save_receipt(receipt_doc)
+    except db.DuplicateClaimError as e:
+        logger.warning("Double-claim blocked: %s", e)
+        await _notify_admins(
+            "⚠️ <b>Double-claim blocked</b>\n\n"
+            f"Fiscal receipt: <code>{e.fiscal_id}</code>\n"
+            f"Vendor: {escape(display_vendor or '-')}\n"
+            f"VAT: {data.get('vat_amount', 0):,.2f} UZS\n"
+            f"Already claimed by user <code>{e.existing_telegram_id}</code>\n"
+            f"Rejected attempt by user <code>{e.new_telegram_id}</code>"
+        )
+        return (
+            "⛔ This receipt has already been claimed by another employee.\n\n"
+            "Each fiscal receipt can only be refunded once, so it was NOT "
+            "added to your records.\n\n"
+            f"If you believe this is a mistake, contact {config.SUPPORT_CONTACT}.",
+            False,
+        )
     if inserted is None:
         return (
             f"This receipt (#{data.get('receipt_number')}) is already in your records.",
@@ -1480,7 +1516,25 @@ async def _save_online_purchase(
         "soliq_items": data.get("items") or [],
         "soliq_meta": data.get("meta") or {},
     }
-    inserted = await db.save_receipt(receipt_doc)
+    try:
+        inserted = await db.save_receipt(receipt_doc)
+    except db.DuplicateClaimError as e:
+        logger.warning("Double-claim blocked (online): %s", e)
+        await _notify_admins(
+            "⚠️ <b>Double-claim blocked</b> (online purchase)\n\n"
+            f"Fiscal receipt: <code>{e.fiscal_id}</code>\n"
+            f"Vendor: {escape(data.get('vendor', '-') or '-')}\n"
+            f"VAT: {data.get('vat_amount', 0):,.2f} UZS\n"
+            f"Already claimed by user <code>{e.existing_telegram_id}</code>\n"
+            f"Rejected attempt by user <code>{e.new_telegram_id}</code>"
+        )
+        await _safe_edit(status,
+            "⛔ This receipt has already been claimed by another employee.\n\n"
+            "Each fiscal receipt can only be refunded once, so it was NOT "
+            "added to your records.\n\n"
+            f"If you believe this is a mistake, contact {config.SUPPORT_CONTACT}."
+        )
+        return
     if inserted is None:
         await _safe_edit(status,
             f"This receipt (#{receipt_no}) is already in your records."
@@ -1959,6 +2013,8 @@ _BOT_COMMANDS = [
 
 
 async def _post_init(app: Application) -> None:
+    global _APP_BOT
+    _APP_BOT = app.bot
     asyncio.get_running_loop().set_default_executor(_executor)
 
     # Retry the initial Telegram handshake — WiFi can drop for a few seconds
@@ -1997,6 +2053,11 @@ async def _post_init(app: Application) -> None:
     for attempt in range(1, 4):
         try:
             await db.ping()
+            # Backfill BEFORE ensure_indexes: the unique fiscal_id index
+            # can only build once historical receipts carry the field.
+            backfilled = await db.migrate_backfill_fiscal_ids()
+            if backfilled:
+                logger.info("Backfilled fiscal_id on %s receipt(s).", backfilled)
             await db.ensure_indexes()
             migrated = await db.migrate_legacy_users_to_approved()
             if migrated:
