@@ -25,14 +25,13 @@ logger = logging.getLogger("vat_bot.qr")
 register_heif_opener()
 
 _QR_DETECTOR = cv2.QRCodeDetector()
-# QRCodeDetectorAruco (OpenCV ≥4.7) uses an Aruco-style finder pattern locator
-# that handles tilted / perspective-distorted QR codes better than the classic
-# detector. We use it alongside the classic detector, not as a replacement —
-# they fail on different inputs, so trying both raises the success rate.
-try:
-    _QR_DETECTOR_ARUCO = cv2.QRCodeDetectorAruco()
-except AttributeError:
-    _QR_DETECTOR_ARUCO = None
+# NOTE: cv2.QRCodeDetectorAruco is intentionally NOT used. Its native
+# marker-candidate search corrupted the heap on a real phone photo
+# (SIGTRAP inside cv::aruco::ArucoDetectorImpl::identifyCandidates,
+# production crash 2026-08-09) — the second cv2 native crash after
+# detectAndDecodeCurved (2026-05-14). C++ crashes kill the whole
+# process and cannot be caught from Python. zxing-cpp + the classic
+# OpenCV detector + pyzbar cover the same inputs safely.
 
 
 def _to_cv(image_bytes: bytes) -> np.ndarray:
@@ -232,10 +231,7 @@ def _downscale_for_decode(img: np.ndarray, max_dim: int = 1800) -> np.ndarray:
 
 def _decode_with_opencv(img: np.ndarray) -> list[str]:
     results: list[str] = []
-    detectors = [_QR_DETECTOR]
-    if _QR_DETECTOR_ARUCO is not None:
-        detectors.append(_QR_DETECTOR_ARUCO)
-    for detector in detectors:
+    for detector in (_QR_DETECTOR,):
         try:
             data, _, _ = detector.detectAndDecode(img)
             if data:

@@ -62,6 +62,14 @@ ensure_dependencies() {
   source .venv/bin/activate
   pip install --quiet --upgrade pip
   pip install --quiet -r requirements.txt
+
+  # Headless Chromium for Playwright — REQUIRED since soliq.uz became a
+  # client-side SPA (July 2026): receipt data AND the PDF screenshots
+  # both come from a browser trip. Idempotent — playwright checks its
+  # cache and returns fast when the browser is already downloaded.
+  # Without this, a fresh redeploy would silently save every receipt
+  # with no data ("0 VAT") and no screenshot.
+  .venv/bin/playwright install chromium 2>&1 | tail -1
 }
 
 # ----- Install the launchd agent (login-launched, auto-restart) -----

@@ -121,13 +121,22 @@ async def capture(url: str) -> tuple[Optional[bytes], Optional[dict]]:
             page.on("response", lambda r: asyncio.create_task(_capture_response(r)))
 
             try:
-                # networkidle so the SPA's XHR completes before we
-                # screenshot. domcontentloaded fires before the API
-                # call and would give us a blank React shell.
-                await page.goto(url, wait_until="networkidle",
+                # "load" instead of "networkidle": the SPA's embedded
+                # Yandex map keeps polling forever, so networkidle
+                # regularly never settles and goto dies with
+                # ERR_TIMED_OUT (≈15 capture failures Jul–Aug 2026).
+                # We don't care about idle — we care about the payment
+                # API response, which we intercept explicitly below.
+                await page.goto(url, wait_until="load",
                                 timeout=_NAV_TIMEOUT_MS)
-                # Small buffer in case the response handler is still
-                # awaiting body() when goto returns.
+                # Wait for the SPA's API call to land (usually <2s).
+                # Poll the holder the response handler fills instead of
+                # guessing at network state.
+                for _ in range(48):  # up to 12s
+                    if "value" in api_data:
+                        break
+                    await page.wait_for_timeout(250)
+                # Give React a beat to paint the data we just saw.
                 await page.wait_for_timeout(400)
 
                 # Find the receipt content's bounding box for a tight
