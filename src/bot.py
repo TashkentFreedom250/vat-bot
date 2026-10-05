@@ -1666,6 +1666,8 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_approved(update):
         return
     msg = update.message
+    if msg is None:
+        return  # edited/channel update — no new photo to process
     uid = update.effective_user.id
     await db.upsert_user(uid, update.effective_user.full_name or "")
 
@@ -1892,6 +1894,8 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     typed in response to /setname without arguments."""
     if not await _require_approved(update):
         return
+    if update.message is None:
+        return  # edited/channel update slipped through — nothing to act on
     uid = update.effective_user.id
     text = (update.message.text or "").strip()
 
@@ -2158,9 +2162,16 @@ def _build_app() -> Application:
     # Inline Approve/Deny buttons on the new-user notification messages.
     app.add_handler(CallbackQueryHandler(access_callback, pattern=r"^access:"))
 
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.Document.IMAGE, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # filters.UpdateType.MESSAGE restricts these to genuinely new
+    # messages. Without it PTB also routes edited_message (and channel
+    # posts) to the same callbacks, where update.message is None — an
+    # approved user editing any text message crashed handle_text with
+    # AttributeError (2026-10-03). Re-running a handler on an edit is
+    # also wrong behaviourally: an edited soliq URL would re-save.
+    _new_msg = filters.UpdateType.MESSAGE
+    app.add_handler(MessageHandler(_new_msg & filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(_new_msg & filters.Document.IMAGE, handle_photo))
+    app.add_handler(MessageHandler(_new_msg & filters.TEXT & ~filters.COMMAND, handle_text))
     return app
 
 
