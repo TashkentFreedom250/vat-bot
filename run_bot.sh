@@ -121,9 +121,22 @@ if launchctl list | grep -q "$BOT_LABEL"; then
   exit 0
 fi
 
+# Rebuild the one-click Desktop restore button so a fresh machine gets
+# it automatically (the .app is a build artifact; its source lives in
+# scripts/vatbot_button.applescript).
+build_restore_button() {
+  if [ -f "$PROJECT_DIR/scripts/vatbot_button.applescript" ]; then
+    rm -rf "$HOME/Desktop/Restore VAT Bot.app"
+    /usr/bin/osacompile -o "$HOME/Desktop/Restore VAT Bot.app" \
+      "$PROJECT_DIR/scripts/vatbot_button.applescript" 2>/dev/null \
+      && echo "Desktop button installed: Restore VAT Bot.app"
+  fi
+}
+
 echo ""
 echo "Installing the bot as a login-launched service..."
 install_launchd_agent
+build_restore_button
 sleep 2
 echo ""
 echo "Done. The bot is now running and will auto-start every time you log in."
