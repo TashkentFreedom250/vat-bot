@@ -1,5 +1,8 @@
 # Tashkent Embassy VAT Refund Bot — V12
 
+> **Taking this over from someone else? Read [HANDOVER.md](HANDOVER.md) first** —
+> what to do when it is down, what breaks, and three things that need an owner.
+
 A Telegram bot that helps US Embassy employees in Uzbekistan collect receipts and file VAT refund requests automatically. Access is gated to approved staff via a DT-managed approval queue.
 
 ## What it does
