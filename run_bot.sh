@@ -131,6 +131,12 @@ build_restore_button() {
       "$PROJECT_DIR/scripts/vatbot_button.applescript" 2>/dev/null \
       && echo "Desktop button installed: Restore VAT Bot.app"
   fi
+  if [ -f "$PROJECT_DIR/scripts/vatbot_dashboard.applescript" ]; then
+    rm -rf "$HOME/Desktop/VAT Bot Dashboard.app"
+    /usr/bin/osacompile -o "$HOME/Desktop/VAT Bot Dashboard.app" \
+      "$PROJECT_DIR/scripts/vatbot_dashboard.applescript" 2>/dev/null \
+      && echo "Desktop dashboard installed: VAT Bot Dashboard.app"
+  fi
 }
 
 echo ""

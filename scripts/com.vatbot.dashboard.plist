@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  OPTIONAL: keeps the status dashboard running at all times.
+  Not required - the "VAT Bot Dashboard" Desktop icon starts the server
+  on demand. Install only if you want the page always ready:
+
+    cp scripts/com.vatbot.dashboard.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.vatbot.dashboard.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vatbot.dashboard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/tashkent/Tashkent/vat-bot/.venv/bin/python</string>
+        <string>/Users/tashkent/Tashkent/vat-bot/scripts/dashboard.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/tashkent/Tashkent/vat-bot</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/tashkent/Tashkent/vat-bot/logs/dashboard.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/tashkent/Tashkent/vat-bot/logs/dashboard.err.log</string>
+</dict>
+</plist>
