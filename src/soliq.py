@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 from urllib.parse import parse_qs, urlparse
@@ -29,6 +30,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from . import config
+from .soliq_url import find_soliq_url
 
 logger = logging.getLogger("vat_bot.soliq")
 
@@ -38,42 +40,130 @@ USER_AGENT = (
 )
 
 
+@dataclass
+class FetchResult:
+    """Outcome of one soliq.uz lookup.
+
+    `reason` tells the caller what kind of failure it was, so the user
+    gets advice that matches (wait and retry vs. fix the link):
+      ok          data is present
+      not_found   soliq has no such receipt (yet) — new receipts can
+                  take up to 48 h to reach the tax system
+      rejected    soliq says the link's fiscal sign is wrong
+      bad_link    not a soliq.uz receipt link at all
+      unreachable soliq.uz did not answer — their side or our network
+      unreadable  soliq answered but we could not find VAT/total in it
+    """
+
+    data: Optional[dict] = None
+    diag: str = "ok"
+    reason: str = "ok"
+    screenshot: Optional[bytes] = None
+
+    @property
+    def worth_retrying(self) -> bool:
+        """True when sending the very same link again later may work."""
+        return self.reason in ("not_found", "unreachable")
+
+
+_DIAG_NOT_FOUND = (
+    "soliq.uz doesn't have this receipt yet. New receipts can take up "
+    "to 48 hours to reach the tax system — please try again later."
+)
+_DIAG_REJECTED = (
+    "soliq.uz rejected this link — its security code doesn't match, so "
+    "the link is incomplete or was misread."
+)
+_DIAG_BAD_LINK = "That is not a soliq.uz receipt link."
+_DIAG_UNREACHABLE = (
+    "soliq.uz isn't responding right now. That is a problem on the tax "
+    "website's side (or this computer's internet) — please try again "
+    "in a few minutes."
+)
+_DIAG_UNREADABLE = (
+    "soliq.uz answered, but I couldn't read the VAT/total from it. "
+    "The site's layout may have changed."
+)
+
+
 async def fetch_receipt_data(qr_url: str) -> Optional[dict]:
     """Fetch and parse a soliq.uz receipt page from a QR URL."""
-    result, _ = await fetch_receipt_with_diag(qr_url)
-    return result
+    return (await fetch_receipt(qr_url, want_screenshot=False)).data
 
 
 async def fetch_receipt_with_diag(qr_url: str) -> tuple[Optional[dict], str]:
-    """Like fetch_receipt_data but also returns a human-readable failure reason.
+    """Like fetch_receipt_data but also returns a human-readable failure reason."""
+    result = await fetch_receipt(qr_url, want_screenshot=False)
+    return result.data, result.diag
 
-    Since June 2026 the primary strategy is a browser-based fetch (soliq
-    switched their site to a client-side React SPA — the old /check URL
-    now returns an empty shell, and the receipt data only exists after
-    the SPA calls new-ofd.soliq.uz/api/payment with a signed X-Signature
-    header we can't reproduce). We drive a headless Chromium (shared
-    with the PDF screenshot module) and intercept the API response.
-    The httpx-based path is retained only as a defensive fallback.
+
+async def fetch_receipt(qr_url: str, *, want_screenshot: bool = True) -> FetchResult:
+    """Look a receipt up on soliq.uz: data and (optionally) the page
+    screenshot from ONE browser trip. Never raises.
+
+    Since June 2026 soliq.uz is a client-side app: the receipt data only
+    exists in the answer to the page's own call to
+    new-ofd.soliq.uz/api/payment (signed with a header we can't
+    reproduce), so we drive a headless Chromium and intercept it — see
+    soliq_screenshot.fetch_page. The httpx path below is kept only as a
+    defensive fallback in case soliq goes back to server-rendered pages.
     """
-    if not qr_url:
-        return None, "Empty QR URL."
+    url = find_soliq_url(qr_url or "")
+    if not url:
+        return FetchResult(diag=_DIAG_BAD_LINK, reason="bad_link")
 
-    # --- Primary: intercept the SPA's API response via shared browser --
+    # --- Primary: intercept the page's API response via the shared browser
+    api_answered = False
     try:
         from . import soliq_screenshot
-        # capture() returns (screenshot_png, api_data) — we only want the
-        # data here. The screenshot is cached implicitly by the caller
-        # calling capture() again later if needed. TODO: unify the two
-        # trips so we only navigate once per receipt.
-        _png, api_data = await soliq_screenshot.capture(qr_url)
-        if api_data:
-            normalized = _normalize_new_api(api_data, qr_url)
-            if normalized:
-                return normalized, "ok"
-    except Exception:
-        logger.exception("Browser-based soliq fetch failed for %s", qr_url)
 
-    # --- Fallback: httpx (works only on legacy soliq endpoints) --------
+        cap = await soliq_screenshot.fetch_page(url, want_screenshot=want_screenshot)
+        if cap.api_data:
+            api_answered = True
+            normalized = _normalize_new_api(cap.api_data, url)
+            if normalized:
+                return FetchResult(data=normalized, screenshot=cap.screenshot)
+        elif cap.fatal:
+            return FetchResult(diag=_DIAG_BAD_LINK, reason="bad_link")
+        elif cap.api_status == 404:
+            return FetchResult(diag=_DIAG_NOT_FOUND, reason="not_found")
+        elif cap.api_status in (400, 422):
+            return FetchResult(diag=_DIAG_REJECTED, reason="rejected")
+        elif cap.definitive:
+            # e.g. 403 — what soliq answers from a non-Uzbekistan address.
+            return FetchResult(
+                diag=f"soliq.uz refused the lookup (HTTP {cap.api_status}).",
+                reason="unreachable",
+            )
+    except Exception:
+        logger.exception("Browser-based soliq fetch failed for %s", url)
+
+    # --- Fallback: plain HTTP (only useful on legacy soliq endpoints)
+    data, reason = await _fetch_via_http(url)
+    if data:
+        return FetchResult(data=data)
+    if api_answered:
+        # The API answered 200 but in a shape we no longer understand.
+        reason = "unreadable"
+    diag = _DIAG_UNREADABLE if reason == "unreadable" else _DIAG_UNREACHABLE
+    return FetchResult(diag=diag, reason=reason)
+
+
+def _is_spa_shell(body: str) -> bool:
+    """The empty <div id="root"> page soliq serves for every URL now.
+    Seeing it means there is nothing to scrape on ANY endpoint variant."""
+    return len(body) < 3000 and 'id="root"' in body
+
+
+async def _fetch_via_http(qr_url: str) -> tuple[Optional[dict], str]:
+    """Legacy scrape. Returns (data, reason) with reason 'ok',
+    'unreachable' or 'unreadable'.
+
+    Bounded on purpose: this used to try four endpoint variants with a
+    30 s timeout each, so a soliq outage kept the user waiting up to two
+    extra minutes for an answer that could only be "it's down". Now a
+    network error or the SPA shell ends the attempt immediately — the
+    other variants live on the same host and would fare no better."""
     try:
         qs = parse_qs(urlparse(qr_url).query)
     except Exception:
@@ -99,81 +189,68 @@ async def fetch_receipt_with_diag(qr_url: str) -> tuple[Optional[dict], str]:
             if variant not in urls_to_try:
                 urls_to_try.append(variant)
 
-    network_errors = 0
-    bad_statuses: list[int] = []
+    reached = False
     parsed_but_empty = 0
 
     client_kwargs = dict(
-        timeout=config.SOLIQ_TIMEOUT,
+        timeout=min(config.SOLIQ_TIMEOUT, 10),
         headers={"User-Agent": USER_AGENT, "Accept-Language": "uz,en;q=0.9,ru;q=0.8"},
         follow_redirects=True,
     )
     if config.SOLIQ_PROXY:
         client_kwargs["proxy"] = config.SOLIQ_PROXY
 
-    async with httpx.AsyncClient(**client_kwargs) as client:
-        for url in urls_to_try:
-            try:
-                resp = await client.get(url)
-            except Exception as exc:
-                network_errors += 1
-                logger.warning("soliq.uz fetch error for %s: %r", url, exc)
-                continue
-
-            if resp.status_code != 200:
-                bad_statuses.append(resp.status_code)
-                logger.warning("soliq.uz returned HTTP %s for %s", resp.status_code, url)
-                continue
-
-            content_type = resp.headers.get("content-type", "")
-            body = resp.text
-            logger.info(
-                "soliq.uz %s → %s, content-type=%s, len=%s",
-                url, resp.status_code, content_type, len(body),
-            )
-
-            # Sniff JSON by content-type OR by body shape (some endpoints
-            # return JSON with text/html on this host).
-            looks_json = "application/json" in content_type or body.lstrip().startswith(("{", "["))
-            if looks_json:
+    try:
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            for url in urls_to_try:
                 try:
-                    data = resp.json()
-                except Exception:
+                    resp = await client.get(url)
+                except Exception as exc:
+                    logger.warning("soliq.uz fetch error for %s: %r", url, exc)
+                    break  # same host for every variant — don't queue up more timeouts
+
+                reached = True
+                if resp.status_code != 200:
+                    logger.warning("soliq.uz returned HTTP %s for %s", resp.status_code, url)
+                    continue
+
+                content_type = resp.headers.get("content-type", "")
+                body = resp.text
+                logger.info(
+                    "soliq.uz %s → %s, content-type=%s, len=%s",
+                    url, resp.status_code, content_type, len(body),
+                )
+                if _is_spa_shell(body):
+                    break
+
+                # Sniff JSON by content-type OR by body shape (some endpoints
+                # return JSON with text/html on this host).
+                looks_json = "application/json" in content_type or body.lstrip().startswith(("{", "["))
+                if looks_json:
                     try:
-                        import json as _json
-                        data = _json.loads(body)
+                        data = resp.json()
                     except Exception as exc:
                         logger.warning("JSON parse failed for %s: %s", url, exc)
                         data = None
-                if data is not None:
-                    normalized = _normalize_json(data, terminal or "", receipt or "")
-                    if normalized:
-                        return normalized, "ok"
+                    if isinstance(data, dict):
+                        normalized = _normalize_json(data, terminal or "", receipt or "")
+                        if normalized:
+                            return normalized, "ok"
 
-            try:
-                parsed = _parse_html(body, qr_url, fallback_date=fallback_date)
-                if parsed:
-                    return parsed, "ok"
-                parsed_but_empty += 1
-            except Exception as exc:
-                logger.warning("HTML parse error for %s: %s", url, exc)
+                try:
+                    parsed = _parse_html(body, qr_url, fallback_date=fallback_date)
+                    if parsed:
+                        return parsed, "ok"
+                    parsed_but_empty += 1
+                except Exception as exc:
+                    logger.warning("HTML parse error for %s: %s", url, exc)
+    except Exception:
+        logger.exception("Legacy soliq fetch crashed for %s", qr_url)
 
-    logger.warning("fetch_receipt_data: all attempts failed for %s", qr_url)
-    if network_errors and not bad_statuses and not parsed_but_empty:
-        diag = (
-            "I couldn't reach ofd.soliq.uz from this computer — check the "
-            "internet connection. (This machine must be on an Uzbekistan ISP.)"
-        )
-    elif bad_statuses and not parsed_but_empty:
-        diag = f"soliq.uz returned HTTP {bad_statuses[0]} for every attempt."
-    elif parsed_but_empty:
-        diag = (
-            "soliq.uz loaded the page but I couldn't read VAT/total from it. "
-            "The page layout may have changed."
-        )
-    else:
-        diag = "All soliq.uz attempts failed for an unknown reason."
-    return None, diag
+    logger.warning("fetch_receipt: all attempts failed for %s", qr_url)
+    if reached and parsed_but_empty:
+        return None, "unreadable"
+    return None, "unreachable"
 
 
 def _normalize_new_api(data: dict, qr_url: str) -> Optional[dict]:
@@ -250,8 +327,41 @@ def _normalize_new_api(data: dict, qr_url: str) -> Optional[dict]:
         "total_amount": total,
         "items": items,
         "meta": {k: str(v) for k, v in meta.items() if v},
+        "fiscal_id": _canonical_fiscal_id(payload, qr_url),
         "raw": {"source": "new-ofd-api", "terminal": terminal_id},
     }
+
+
+def _canonical_fiscal_id(payload: dict, qr_url: str) -> Optional[str]:
+    """The receipt's identity as SOLIQ states it, in the same
+    "terminal:number:timestamp:sign" form db.fiscal_id_from_url builds
+    from the link.
+
+    Why not just trust the link: soliq.uz returns the very same receipt
+    when the link's timestamp (c=) is changed by a digit, or its number
+    (r=) is given a leading zero (verified Nov 2026). An identity built
+    from the link alone therefore let one receipt be registered twice
+    under two "different" ids, slipping past the double-claim guard.
+    Terminal, number and timestamp here come from soliq's answer; only
+    the fiscal sign is taken from the link, and soliq rejects a link
+    whose sign is off by even one character.
+
+    For a genuine QR link this equals the link-derived id (checked on
+    24 stored receipts: 24/24), so ids already in the database stay
+    valid. Returns None if soliq's answer lacks a part — the caller
+    then falls back to the link-derived id."""
+    try:
+        terminal = str(payload.get("terminalId") or "").strip()
+        number = str(payload.get("paymentNo") or "").strip()
+        day, _, clock = str(payload.get("paymentDate") or "").strip().partition(" ")
+        dd, mm, yyyy = day.split(".")
+        stamp = f"{yyyy}{mm}{dd}{clock.replace(':', '')}"
+        sign = (parse_qs(urlparse(qr_url).query).get("s") or [""])[0].strip()
+    except Exception:
+        return None
+    if not (terminal and number and sign and len(stamp) == 14 and stamp.isdigit()):
+        return None
+    return f"{terminal}:{number}:{stamp}:{sign}"
 
 
 def _items_from_new_api(details: list) -> list[dict]:
