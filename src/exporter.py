@@ -4,12 +4,15 @@ and to a PDF containing all receipt images.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import shutil
+from functools import partial
 from pathlib import Path
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font
+from reportlab import rl_config
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
@@ -27,6 +30,14 @@ from reportlab.platypus import (
 from . import config, db
 
 logger = logging.getLogger("vat_bot.exporter")
+
+# Store images in the PDF as plain binary instead of ASCII-85 text.
+# ASCII-85 is a relic for 7-bit mail gateways: it inflates every
+# embedded screenshot by 25% and reportlab encodes it in pure Python.
+# Measured on a 279-receipt export: a 60-receipt part went from 52.8 MB
+# — over Telegram's 50 MB limit for bot uploads, so it could not be
+# sent at all — to about 42 MB, and the build got several times faster.
+rl_config.useA85 = 0
 
 # XLSX layout (inspected from the template):
 # Columns: A=#, B=Date, C=Vendor, D=Receipt#, E=VAT Amount
@@ -49,6 +60,15 @@ PER_SHEET_TOTAL_COL = 5   # Column E
 
 def _display_vendor(doc: dict) -> str:
     return doc.get("display_vendor") or doc.get("printed_vendor") or doc.get("vendor") or ""
+
+
+def _valid_stir(value) -> bool:
+    """A taxpayer number is digits only (9 for companies, 14 for
+    individuals). Some receipts saved from soliq's old HTML page carry a
+    stray page label in this field ("Savdo cheki/Sotuv"); printing that
+    on a tax document as the seller's STIR is worse than leaving it off."""
+    text = str(value or "").strip()
+    return text.isdigit() and len(text) in (9, 14)
 
 
 def _find_data_start(ws) -> int:
@@ -153,10 +173,37 @@ def build_xlsx_from_receipts(
     return output_path
 
 
-# Each receipt is one rendered page (no embedded photos), so PDFs stay
-# small. The cap is kept generous to limit cover-page bloat and keep a
-# single year manageable for the tax office to review.
+# At most this many receipts per PDF file — keeps a single file
+# manageable for the tax office to review.
 RECEIPTS_PER_PDF = 60
+# ...and at most this many bytes of soliq.uz screenshots per file.
+# Telegram refuses bot uploads over 50 MB, and screenshots of long
+# receipts run to 1 MB+ each, so 60 of them can exceed that. A part is
+# closed early when the next receipt would push it past this budget.
+PDF_IMAGE_BUDGET_BYTES = 40 * 1024 * 1024
+
+
+def _split_into_parts(
+    receipts: list[dict], image_sizes: dict[str, int]
+) -> list[list[dict]]:
+    """Group receipts into PDF parts: up to RECEIPTS_PER_PDF receipts
+    and PDF_IMAGE_BUDGET_BYTES of screenshots each, order preserved."""
+    parts: list[list[dict]] = []
+    current: list[dict] = []
+    current_bytes = 0
+    for r in receipts:
+        size = image_sizes.get(r.get("soliq_screenshot_file_id") or "", 0)
+        if current and (
+            len(current) >= RECEIPTS_PER_PDF
+            or current_bytes + size > PDF_IMAGE_BUDGET_BYTES
+        ):
+            parts.append(current)
+            current, current_bytes = [], 0
+        current.append(r)
+        current_bytes += size
+    if current:
+        parts.append(current)
+    return parts
 
 
 async def build_pdf(telegram_id: int, employee_name: str, output_path: Path) -> Path:
@@ -192,29 +239,46 @@ async def build_pdfs_from_receipts(
     if not receipts:
         return []
 
-    chunks = [
-        receipts[i : i + RECEIPTS_PER_PDF]
-        for i in range(0, len(receipts), RECEIPTS_PER_PDF)
-    ]
+    image_sizes = await db.image_sizes(
+        [r.get("soliq_screenshot_file_id") for r in receipts]
+    )
+    chunks = _split_into_parts(receipts, image_sizes)
     total_vat_all = sum(float(r.get("vat_amount") or 0) for r in receipts)
     total_parts = len(chunks)
     out_paths: list[Path] = []
 
+    loop = asyncio.get_running_loop()
+    global_offset = 0  # receipts in earlier parts (parts can differ in length)
     for part_idx, chunk in enumerate(chunks, 1):
-        global_offset = (part_idx - 1) * RECEIPTS_PER_PDF
         suffix = f"_part{part_idx}_of_{total_parts}" if total_parts > 1 else ""
         out_path = output_dir / f"{name_prefix}{suffix}.pdf"
-        await _write_pdf_chunk(
-            chunk=chunk,
-            employee_name=employee_name,
-            part_idx=part_idx,
-            total_parts=total_parts,
-            global_offset=global_offset,
-            grand_total_vat=total_vat_all,
-            total_receipts=len(receipts),
-            output_path=out_path,
+        # Two phases, so one person's export can't freeze the bot for
+        # everyone else:
+        #   1. pull this part's screenshots out of GridFS concurrently
+        #      (async I/O, a few at a time);
+        #   2. lay the PDF out in a worker thread — reportlab is pure
+        #      CPU and used to run on the event loop, stalling every
+        #      other user's messages page by page.
+        shots = await db.get_images(
+            [r.get("soliq_screenshot_file_id") for r in chunk]
+        )
+        await loop.run_in_executor(
+            None,
+            partial(
+                _write_pdf_chunk,
+                chunk=chunk,
+                shots=shots,
+                employee_name=employee_name,
+                part_idx=part_idx,
+                total_parts=total_parts,
+                global_offset=global_offset,
+                grand_total_vat=total_vat_all,
+                total_receipts=len(receipts),
+                output_path=out_path,
+            ),
         )
         out_paths.append(out_path)
+        global_offset += len(chunk)
 
     return out_paths
 
@@ -332,7 +396,7 @@ def _build_receipt_page_story(r: dict, global_i: int, total_receipts: int,
     ]
     if meta.get("time"):
         header_rows.append(("Time", meta["time"]))
-    if meta.get("stir"):
+    if _valid_stir(meta.get("stir")):
         header_rows.append(("STIR / INN", meta["stir"]))
     if meta.get("terminal"):
         header_rows.append(("Terminal", meta["terminal"]))
@@ -470,9 +534,10 @@ def _build_receipt_page_story(r: dict, global_i: int, total_receipts: int,
     return story
 
 
-async def _write_pdf_chunk(
+def _write_pdf_chunk(
     *,
     chunk: list[dict],
+    shots: dict[str, bytes],
     employee_name: str,
     part_idx: int,
     total_parts: int,
@@ -554,8 +619,9 @@ async def _write_pdf_chunk(
         c.showPage()
         global_i = global_offset + slot_idx + 1
         slot_y = margin + footer_h
-        await _draw_receipt_slot(
-            c, r, global_i, total_receipts,
+        _draw_receipt_slot(
+            c, r, shots.get(r.get("soliq_screenshot_file_id") or ""),
+            global_i, total_receipts,
             margin, slot_y, slot_w, slot_h,
         )
 
@@ -572,10 +638,15 @@ async def _write_pdf_chunk(
     c.save()
 
 
-async def _draw_receipt_slot(c, r: dict, global_i: int, total_receipts: int,
-                             x: float, y: float, w: float, h: float) -> None:
+def _draw_receipt_slot(c, r: dict, shot_bytes: bytes | None,
+                       global_i: int, total_receipts: int,
+                       x: float, y: float, w: float, h: float) -> None:
     """Render one receipt into a rectangle. Two-column body: screenshot
-    on the left, scannable QR + identity block on the right."""
+    on the left, scannable QR + identity block on the right.
+
+    `shot_bytes` is the stored soliq.uz screenshot, already loaded by
+    the caller (None when the receipt has none — the data view is drawn
+    instead)."""
     HEADER_H = 7 * mm
     pad = 2 * mm
     body_y = y + pad
@@ -600,11 +671,9 @@ async def _draw_receipt_slot(c, r: dict, global_i: int, total_receipts: int,
     qr_col_x = x + shot_col_w + GAP
 
     # Left column — screenshot, or data-render fallback for old receipts.
-    shot_id = r.get("soliq_screenshot_file_id")
     rendered = False
-    if shot_id:
+    if shot_bytes:
         try:
-            shot_bytes = await db.get_image(shot_id)
             _draw_image_fit(c, shot_bytes, x, body_y, shot_col_w, body_h, anchor="top")
             rendered = True
         except Exception:
@@ -641,7 +710,7 @@ def _draw_qr_and_info(c, r: dict, x: float, y: float, w: float, h: float) -> Non
         ("VAT", f"{float(r.get('vat_amount') or 0):,.2f} UZS"),
     ]
     meta = r.get("soliq_meta") or {}
-    if meta.get("stir"):
+    if _valid_stir(meta.get("stir")):
         info_lines.append(("STIR", str(meta["stir"])))
     if meta.get("time"):
         info_lines.append(("Time", str(meta["time"])))

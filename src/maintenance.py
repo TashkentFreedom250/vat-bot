@@ -126,6 +126,21 @@ def _check_disk() -> None:
         logger.info("Disk OK: %s%% full, %.1f GB free", pct, free_gb)
 
 
+def _purge_stale_exports(max_age_hours: float = 24) -> None:
+    """Delete export files left behind in tmp/ — an export interrupted
+    by a restart never reaches its own cleanup, and these files hold
+    employees' receipt data (two 87 MB PDFs sat there for months)."""
+    cutoff = datetime.now().timestamp() - max_age_hours * 3600
+    for pattern in ("Receipts_*.pdf", "VAT_Refund_*.xlsx"):
+        for path in config.TMP_DIR.glob(pattern):
+            try:
+                if path.is_file() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    logger.info("Removed stale export file: %s", path.name)
+            except Exception:
+                logger.exception("Could not remove stale export %s", path.name)
+
+
 async def run_nightly(_context=None) -> None:
     """Scheduled nightly job: backup, prune, disk check."""
     logger.info("Nightly maintenance starting.")
@@ -133,6 +148,7 @@ async def run_nightly(_context=None) -> None:
         await _run_backup()
         _prune_old_backups()
         _truncate_launchd_logs()
+        _purge_stale_exports()
         _check_disk()
     except Exception:
         logger.exception("Nightly maintenance failed")

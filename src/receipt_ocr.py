@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 
 from .receipt_image import _to_cv
+from .soliq_url import is_soliq_url
 
 logger = logging.getLogger("vat_bot.ocr")
 
@@ -195,7 +196,37 @@ def extract_soliq_url_candidates(image_bytes: bytes, max_candidates: int = 6) ->
         return []
     if img.size == 0:
         return []
+    return _url_candidates_from_lines(_ocr_lines(img), max_candidates)
+
+
+def analyze_unreadable(image_bytes: bytes, max_candidates: int = 6) -> dict:
+    """Everything OCR can tell us about a photo whose QR would not
+    decode, from ONE read of the image:
+
+      candidates      soliq.uz links printed on the receipt (to validate
+                      against soliq — see extract_soliq_url_candidates)
+      classification  fiscal receipt / card payment slip / unknown
+
+    The bot used to OCR the photo twice for these (once per question),
+    about 1.4 s each, while the user waited."""
+    empty = {"candidates": [], "classification": {"kind": "unknown"}}
+    try:
+        img = _downscale_for_ocr(_to_cv(image_bytes))
+    except Exception:
+        logger.exception("OCR-fallback: image decode failed")
+        return empty
+    if img.size == 0:
+        return empty
     lines = _ocr_lines(img)
+    if not lines:
+        return empty
+    return {
+        "candidates": _url_candidates_from_lines(lines, max_candidates),
+        "classification": _classify_lines(lines, image_height=img.shape[0]),
+    }
+
+
+def _url_candidates_from_lines(lines: list[dict], max_candidates: int) -> list[str]:
     if not lines:
         return []
 
@@ -214,7 +245,9 @@ def extract_soliq_url_candidates(image_bytes: bytes, max_candidates: int = 6) ->
         if "soliq" not in cleaned.lower() and not _SOLIQ_HOST_VARIANTS.search(cleaned):
             continue
         for variant in _url_variants(cleaned):
-            if variant in seen:
+            # Only genuine soliq.uz hosts are worth a lookup; anything
+            # else is OCR noise we could not repair.
+            if variant in seen or not is_soliq_url(variant):
                 continue
             seen.add(variant)
             candidates.append(variant)
@@ -232,6 +265,14 @@ def _clean_url_fragment(raw: str) -> str:
     s = re.sub(r"^https?[:;]?[/\\]{0,3}", "https://", s, count=1, flags=re.IGNORECASE)
     for bad, good in _OCR_CHAR_FIXES:
         s = s.replace(bad, good)
+    # Repair a misread host ("so1iq.uz", "solig.uz", "0fd.") — but only
+    # in the host part, never in the query string.
+    scheme, sep, rest = s.partition("://")
+    if sep:
+        host, slash, tail = rest.partition("/")
+        host = _SOLIQ_HOST_VARIANTS.sub("soliq.uz", host, count=1)
+        host = re.sub(r"^[0Oo]fd\.", "ofd.", host)
+        s = f"{scheme}://{host.lower()}{slash}{tail}"
     # Drop anything that's not URL-safe at the tail
     s = re.sub(r"[ \s].*$", "", s)
     return s

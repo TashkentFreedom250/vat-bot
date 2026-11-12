@@ -14,6 +14,12 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 # something clickable in Telegram ("@ShiraliDT") for best UX.
 SUPPORT_CONTACT = os.getenv("SUPPORT_CONTACT", "Shirali DT").strip()
 
+# Where the source code and LICENSE live — shown in the open-source
+# notice (/about). Change it if the repository moves.
+SOURCE_URL = os.getenv(
+    "SOURCE_URL", "https://github.com/TashkentFreedom250/vat-bot"
+).strip()
+
 # Comma-separated Telegram user IDs allowed to call hidden admin commands
 # like /heartcheck. The command returns silently for everyone else, so
 # leaving this empty effectively disables the admin surface.

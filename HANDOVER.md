@@ -60,9 +60,37 @@ refund." That is the signature. Fix is in `src/soliq_screenshot.py`
 the whole process and **cannot be caught by Python**. Both are now
 removed, with comments saying so. Do not add them back.
 
-**Screenshot capture times out occasionally** (soliq being slow). About
-13% of receipts have no stored screenshot. Harmless: their PDF page
-falls back to a clean data view. Not worth chasing.
+**This Mac's network drops out for a minute now and then.** The log
+is full of it (2,380 network errors on 31 Oct alone), and on
+12 Nov 2026 it happened seconds after a deploy: the bot kept
+*receiving* messages over its open long-poll connection but could not
+open a new connection to *send* the answers, so to users it looked
+dead. Since then every outgoing call retries the connection for about a
+minute and a half (`src/tg_request.py`) — answers arrive late instead
+of never. In the log, `Could not connect to Telegram … retry` is that
+mechanism working; `a reply may not have been delivered` means it ran
+out of retries. If users report silence, check the network first:
+`curl -m 8 https://api.telegram.org/` should answer in under a second.
+
+**soliq.uz connections stall now and then.** The site answers in
+~0.5 s when healthy, but some connections just hang. The bot gives a
+stalled try 8 s, then retries (three tries in all), so users rarely
+notice. Lines like `soliq read attempt 1 failed … retrying` in the log
+are that mechanism working, not a fault. About 13% of older receipts
+have no stored screenshot from the days before the retry; their PDF
+page falls back to a clean data view. Harmless.
+
+**Going back to code older than V.13 needs one manual step.** Up to
+V.12 a user could not hold two receipts with the same receipt *number*
+— wrong, because every shop's terminal runs its own counter, so
+unrelated receipts collide (for someone with 200+ receipts, about a
+1-in-6 chance of having had a legitimate receipt refused). V.13
+replaced the database index behind that rule
+(`telegram_id_1_receipt_number_1`, all receipts) with one that covers
+only hand-typed entries (`manual_receipt_number_unique`). The old code
+recreates the old index at startup and **will refuse to start** once any
+user holds two receipts with the same number. If you must roll back,
+keep `src/db.py` from V.13 or later.
 
 **The bot is a LaunchAgent, not a LaunchDaemon.** It starts when a user
 *logs in*, not when the Mac boots. In November 2026 the Mac ran for
@@ -79,6 +107,14 @@ receipt. They can't, as of June 2026. Every QR receipt gets a global
 second person scanning the same physical receipt is refused, and an
 alert is sent to the admin Telegram IDs. Enforced twice: in
 `db.save_receipt` and by a unique database index.
+
+The identity is taken from **soliq.uz's own answer**, not from the
+link. This matters: soliq returns the same receipt when the link's
+timestamp is changed by a digit or its number is given a leading zero,
+so an identity read off the link could be dodged by editing the link.
+(Found and closed in November 2026; an audit of all 2,878 stored links
+showed it had never been used.) An alert for such an attempt says the
+link "had been altered".
 
 **This only works if a real person receives those alerts.** See below.
 
@@ -128,6 +164,8 @@ work. That is why this lives on a Mac in the building.
 ```bash
 tail -f logs/bot.log                    # watch it live
 grep " ERROR " logs/bot.log             # today's errors
+grep "handled in" logs/bot.log          # how long each photo took, and why
+.venv/bin/python -m unittest discover -s tests   # run the tests
 bash scripts/vatbot_restore.sh          # restart everything
 .venv/bin/python scripts/dashboard.py   # status page, port 8808
 ```

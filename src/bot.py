@@ -1,20 +1,27 @@
 """
 Telegram bot entry point.
 
+Adding a receipt: send a photo (or a soliq.uz link as text).
+
 Commands:
-  /start        - welcome + register
-  /setname      - set employee name (used in exports)
-  /add          - reply to this, then send receipt photo(s)
-  /list         - show all stored receipts
-  /export_vat   - get the filled VAT_Refund.xlsx
-  /export_pdf   - get a PDF with all receipt images + summary
-  /reset        - delete all your receipts
-  /help         - show help
+  /start            - welcome + register / request access
+  /setname          - set employee name (used in exports)
+  /manual           - type a receipt in by hand (QR unreadable)
+  /online_purchase  - add a receipt from a soliq.uz link, no photo
+  /list             - show all stored receipts
+  /export_vat       - get the filled VAT_Refund.xlsx
+  /export_pdf       - get the PDF receipt package
+  /reset            - delete all your receipts (asks first)
+  /help             - show help
+Hidden: /whoami, /heartcheck and /report (admins), /pending /approve
+/deny (DT approvers).
 """
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import time as dt_time
+from functools import partial
 from html import escape
 import logging
 import logging.handlers
@@ -41,12 +48,16 @@ from . import (
     db,
     exporter,
     maintenance,
+    notice,
     online_snapshot,
     receipt_image,
     receipt_ocr,
     soliq,
     soliq_screenshot,
 )
+from telegram.request import HTTPXRequest
+
+from .tg_request import ResilientRequest
 
 
 def _configure_logging() -> None:
@@ -124,7 +135,20 @@ async def _on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # the full traceback at ERROR makes routine network noise look like a
     # crash in /heartcheck — record a one-line WARNING instead.
     if isinstance(err, (NetworkError, TimedOut)):
-        logger.warning("Transient network error (auto-retried): %s", err)
+        if update is None:
+            # From the polling loop, which simply polls again.
+            logger.warning("Transient network error (auto-retried): %s", err)
+        else:
+            # From a handler: an answer to a user did not get through,
+            # even after ResilientRequest's connection retries. Say so
+            # honestly — this used to be logged as "auto-retried" too,
+            # which hid lost replies.
+            user = getattr(update, "effective_user", None)
+            logger.warning(
+                "Network error while answering user %s — a reply may not "
+                "have been delivered: %s",
+                getattr(user, "id", "?"), err,
+            )
         return
     # Conflict means two bot instances briefly polled at the same time
     # (e.g. during a launchd restart while a manual run was still alive).
@@ -254,17 +278,20 @@ async def _safe_edit(status_msg, text: str, **kwargs) -> None:
     )
 
 
-async def _keep_typing(bot, chat_id: int, interval: float = 4.0) -> None:
+async def _keep_typing(
+    bot, chat_id: int, interval: float = 4.0, action: str = ChatAction.TYPING
+) -> None:
     """Keep Telegram's "is typing..." indicator alive while a slow
     operation runs. Telegram drops the chat action after ~5 seconds, so
     we re-fire it on a short loop until cancelled. Used during photo
     processing because OCR + multi-soliq lookups can take 5-15 seconds
     on long receipts and the user starts wondering if the bot is hung.
+    Exports pass ChatAction.UPLOAD_DOCUMENT ("sending a file...").
     """
     try:
         while True:
             try:
-                await bot.send_chat_action(chat_id, ChatAction.TYPING)
+                await bot.send_chat_action(chat_id, action)
             except Exception:
                 # Don't let a transient send_chat_action failure kill the
                 # processing loop. Worst case the typing indicator just
@@ -276,101 +303,287 @@ async def _keep_typing(bot, chat_id: int, interval: float = 4.0) -> None:
         pass
 
 
-async def _decode_qr(loop: asyncio.AbstractEventLoop, image_bytes: bytes, cropped_bytes: bytes) -> str | None:
+async def _stop_keepalive(task: asyncio.Task) -> None:
+    task.cancel()
     try:
-        # Try both images concurrently — crop and original are independent inputs
-        original_task = loop.run_in_executor(None, receipt_image.extract_qr_url, image_bytes)
-        cropped_task = loop.run_in_executor(None, receipt_image.extract_qr_url, cropped_bytes)
-        results = await asyncio.gather(original_task, cropped_task, return_exceptions=True)
-        for r in results:
-            if isinstance(r, str) and r:
-                logger.info("QR found: %s", r)
-                return r
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
+async def _decode_qr(
+    loop: asyncio.AbstractEventLoop, image_bytes: bytes, on_crop=None
+) -> tuple[str | None, str]:
+    """Find the soliq.uz QR link in a photo. Returns (url or None, how).
+
+    The search itself lives in receipt_image.find_qr_url: a quick pass
+    that settles nine photos in ten in ~0.1 s, then (only if needed) a
+    time-boxed parallel deep search. It used to take 20-30 s to give up
+    on an unreadable photo; now it is capped at about 10 s.
+    """
+    started = time.monotonic()
+    try:
+        url, how = await loop.run_in_executor(
+            None, partial(receipt_image.find_qr_url, image_bytes, on_crop=on_crop)
+        )
     except Exception:
         logger.exception("QR decode failed")
-    return None
+        url, how = None, "error"
+    if url:
+        logger.info("QR found: %s", url)
+    logger.info("QR search: %s in %.2fs", how, time.monotonic() - started)
+    return url, how
+
+
+def _crash_text(what: str) -> str:
+    """What the user sees when something unexpected broke on our side.
+    Before this existed an unexpected error left the "processing..."
+    message sitting there forever with no answer at all."""
+    return (
+        f"Sorry — something went wrong on my side while handling {what}. "
+        "Nothing was saved. Please send it again; if it keeps happening, "
+        f"contact {config.SUPPORT_CONTACT}."
+    )
+
+
+@dataclass
+class SaveOutcome:
+    """Result of trying to turn a soliq.uz link into a saved receipt.
+
+    `resolved` answers "is the question of THIS receipt settled?" — True
+    when it was saved, is a duplicate, or has no VAT. False when soliq
+    could not be asked (down, receipt not in their system yet, broken
+    link): the user may want to retry with the same photo, so callers
+    keep any pending photo around instead of throwing it away."""
+
+    message: str
+    saved: bool = False
+    resolved: bool = True
+
+
+def _format_saved_on(doc: dict) -> str:
+    when = doc.get("created_at")
+    try:
+        return f" — saved on {when:%d %b %Y}"
+    except Exception:
+        return ""
+
+
+def _soliq_failure_text(result: "soliq.FetchResult", *, pasted_link: bool) -> str:
+    """Explain a failed soliq.uz lookup in terms of what the user should
+    do next. The old single message ("could not fetch data ... page
+    layout may have changed") was shown for everything, including the
+    very common case of a receipt that simply isn't in the tax system
+    yet."""
+    resend = "paste the link again" if pasted_link else "send the photo again"
+    if result.reason == "not_found":
+        body = (
+            "⏳ <b>soliq.uz doesn't have this receipt yet.</b>\n\n"
+            "New receipts can take up to 48 hours to reach the tax "
+            "system. Nothing was saved — please "
+            f"{resend} later (tomorrow is a safe bet)."
+        )
+    elif result.reason == "unreachable":
+        body = (
+            "⚠️ <b>soliq.uz isn't responding right now</b>, so I couldn't "
+            "verify this receipt.\n\n"
+            "That is a problem on the tax website's side, not with your "
+            f"receipt. Nothing was saved — please {resend} in a few minutes."
+        )
+    elif result.reason == "rejected":
+        body = (
+            "soliq.uz did not accept this link — its security code doesn't "
+            "match, which usually means the link was cut off or misread.\n\n"
+            + (
+                "Please copy the complete link and paste it again."
+                if pasted_link
+                else "Please send a sharper photo of the QR code, or paste "
+                "the soliq.uz link (camera → point at the QR → share the link here)."
+            )
+        )
+    elif result.reason == "bad_link":
+        body = (
+            "That doesn't look like a soliq.uz receipt link.\n\n"
+            "A receipt link starts with <code>https://ofd.soliq.uz/</code> "
+            "and is what your phone's camera shows when you point it at "
+            "the QR code on a receipt."
+        )
+    else:
+        body = (
+            "I reached soliq.uz but couldn't read the VAT amount from its "
+            "answer — the website may have changed. Nothing was saved."
+        )
+    return f"{body}\n\nNeed help? Contact {escape(config.SUPPORT_CONTACT)}."
+
+
+async def _duplicate_outcome(
+    uid: int, qr_url: str, *, soliq_fid: str | None = None
+) -> SaveOutcome | None:
+    """Answer 'already saved' / 'already claimed' without storing
+    anything. Called twice per receipt:
+
+      * before the soliq.uz lookup, with the id read off the link — a
+        re-sent receipt is recognised in milliseconds, no lookup needed;
+      * after it, with the id soliq itself reported (`soliq_fid`) — so a
+        link whose parameters were altered is still matched to the
+        receipt it really is.
+
+    db.save_receipt enforces the same rule again at insert time (with a
+    unique index behind it). This is the fast path, not the guarantee."""
+    link_fid = db.fiscal_id_from_url(qr_url)
+    try:
+        existing = await db.find_receipt_by_fiscal_id(link_fid, soliq_fid)
+    except Exception:
+        logger.exception("Duplicate pre-check failed; continuing to full save")
+        return None
+    if not existing:
+        return None
+    if existing.get("telegram_id") == uid:
+        return SaveOutcome(
+            f"This receipt (#{escape(str(existing.get('receipt_number') or '?'))}) "
+            f"is already in your records{_format_saved_on(existing)}."
+        )
+    fid = soliq_fid or link_fid or "-"
+    altered = bool(soliq_fid and link_fid and soliq_fid != link_fid)
+    logger.warning(
+        "Double-claim blocked: fiscal receipt %s already claimed by user %s; "
+        "rejected for user %s%s", fid, existing.get("telegram_id"), uid,
+        " (submitted link did not match soliq's record)" if altered else "",
+    )
+    await _notify_admins(
+        "⚠️ <b>Double-claim blocked</b>\n\n"
+        f"Fiscal receipt: <code>{escape(fid)}</code>\n"
+        f"Vendor: {escape(_display_vendor(existing) or '-')}\n"
+        f"VAT: {float(existing.get('vat_amount') or 0):,.2f} UZS\n"
+        f"Already claimed by user <code>{existing.get('telegram_id')}</code>\n"
+        f"Rejected attempt by user <code>{uid}</code>"
+        + (
+            "\n\n<b>Note:</b> the submitted link's details did not match "
+            "soliq's own record of this receipt (the link had been altered)."
+            if altered else ""
+        )
+    )
+    return SaveOutcome(_double_claim_text())
+
+
+_DOUBLE_CLAIM_TEXT = (
+    "⛔ This receipt has already been claimed by another employee.\n\n"
+    "Each fiscal receipt can only be refunded once, so it was NOT "
+    "added to your records.\n\n"
+    "If you believe this is a mistake, contact {support}."
+)
+
+
+def _double_claim_text() -> str:
+    return _DOUBLE_CLAIM_TEXT.format(support=escape(config.SUPPORT_CONTACT))
 
 
 async def _save_verified_receipt(
     *,
     uid: int,
-    source_image_bytes: bytes,
+    source_image_bytes: bytes | None,
     qr_url: str,
     loop: asyncio.AbstractEventLoop,
     qr_image_bytes: bytes | None = None,
-) -> tuple[str, bool]:
-    # Kick off both the browser trip (renders soliq.uz, intercepts the
-    # SPA's API response, takes a screenshot — all in one trip) AND the
-    # printed-vendor OCR in parallel. The browser trip is now the
-    # primary source of receipt data (soliq switched to a SPA in June
-    # 2026); one trip gets us the JSON payload and the screenshot at
-    # the same time so users don't wait for two sequential nav cycles.
-    printed_vendor_task = loop.run_in_executor(
-        None, receipt_ocr.extract_printed_vendor, source_image_bytes
-    )
-    capture_task = soliq_screenshot.capture(qr_url)
-    printed_vendor_result, capture_result = await asyncio.gather(
-        printed_vendor_task, capture_task, return_exceptions=True
-    )
-    if isinstance(printed_vendor_result, BaseException):
-        logger.exception("Printed vendor OCR failed", exc_info=printed_vendor_result)
-        printed_vendor = None
-    else:
-        printed_vendor = printed_vendor_result
+    prefetched: "soliq.FetchResult | None" = None,
+    pasted_link: bool = False,
+    online_purchase: bool = False,
+) -> SaveOutcome:
+    """Verify a receipt on soliq.uz and store it. The one place where a
+    soliq.uz link becomes a saved receipt — photos, pasted links and
+    /online_purchase all end up here. The returned message is Telegram
+    HTML.
 
-    screenshot_bytes: bytes | None = None
-    api_data: dict | None = None
-    if isinstance(capture_result, BaseException):
-        logger.exception("soliq page capture raised", exc_info=capture_result)
-    elif capture_result:
-        screenshot_bytes, api_data = capture_result
+    `source_image_bytes` is the user's photo. For an online purchase
+    there is none (pass None with online_purchase=True) and a clean
+    snapshot is rendered from the verified data instead, so the entry
+    still has a visual record.
 
-    # Turn the browser-intercepted JSON into our internal receipt dict.
-    # If the intercept missed (network blip, timeout), fall back to
-    # httpx via fetch_receipt_with_diag (which now also has a browser
-    # retry inside it — this is the last-ditch path).
-    data: dict | None = None
-    diag = "ok"
-    if api_data:
-        data = soliq._normalize_new_api(api_data, qr_url)
-    if data is None:
-        data, diag = await soliq.fetch_receipt_with_diag(qr_url)
+    `prefetched` lets a caller that already looked the link up (the OCR
+    fallback validates its guesses against soliq) hand the answer over
+    instead of paying for a second trip."""
+    started = time.monotonic()
 
+    duplicate = await _duplicate_outcome(uid, qr_url)
+    if duplicate is not None:
+        return duplicate
+
+    # One browser trip returns the verified data AND the page screenshot.
+    result = prefetched or await soliq.fetch_receipt(qr_url, want_screenshot=True)
+    data = result.data
     if not data:
-        return (
-            f"I read the QR code but could not fetch data from soliq.uz.\n\n"
-            f"Reason: {diag}\n"
-            f"QR content: {qr_url[:200]}\n\n"
-            f"Need help? Contact {config.SUPPORT_CONTACT}.",
-            False,
+        return SaveOutcome(
+            _soliq_failure_text(result, pasted_link=pasted_link), resolved=False
         )
 
     if not data.get("vat_amount"):
         vendor = data.get("vendor", "") or data.get("receipt_number", "this receipt")
-        return (
-            f"This receipt ({vendor}) has 0 VAT — nothing to refund.\n"
-            "It will not be added to your records.",
-            False,
+        return SaveOutcome(
+            f"This receipt ({escape(str(vendor))}) has 0 VAT — nothing to refund.\n"
+            "It will not be added to your records."
         )
 
-    display_vendor = data.get("vendor", "") or printed_vendor or ""
-    file_id = await db.save_image(uid, source_image_bytes, f"receipt_{uid}.png")
+    # Second duplicate check, now with the identity soliq reported. Only
+    # differs from the first when the link's parameters don't match
+    # soliq's record of the receipt.
+    soliq_fid = data.get("fiscal_id")
+    if soliq_fid and soliq_fid != db.fiscal_id_from_url(qr_url):
+        logger.warning(
+            "Link parameters differ from soliq's record for user %s: %s", uid, qr_url
+        )
+        duplicate = await _duplicate_outcome(uid, qr_url, soliq_fid=soliq_fid)
+        if duplicate is not None:
+            return duplicate
 
-    qr_file_id = None
-    if qr_image_bytes:
+    # soliq.uz names the seller on every receipt, so reading the vendor
+    # off the photo with OCR is only worth it when soliq's name is
+    # missing. (It used to run on EVERY photo — about a second of work,
+    # and across 2,900 saved receipts its result was never once used.)
+    vendor = data.get("vendor", "")
+    printed_vendor = ""
+    if source_image_bytes and (not vendor or vendor == "Unknown vendor"):
         try:
-            qr_file_id = await db.save_image(uid, qr_image_bytes, f"qr_{uid}.png")
+            printed_vendor = await loop.run_in_executor(
+                None, receipt_ocr.extract_printed_vendor, source_image_bytes
+            ) or ""
         except Exception:
-            logger.exception("Failed to save QR close-up image")
+            logger.exception("Printed vendor OCR failed")
+    display_vendor = (
+        printed_vendor if (printed_vendor and vendor in ("", "Unknown vendor")) else vendor
+    )
 
-    screenshot_file_id = None
-    if screenshot_bytes:
+    if online_purchase and not source_image_bytes:
         try:
-            screenshot_file_id = await db.save_image(
-                uid, screenshot_bytes, f"soliq_{uid}.jpg"
+            source_image_bytes = await loop.run_in_executor(
+                None, online_snapshot.render_online_receipt_png, data, qr_url
             )
         except Exception:
-            logger.exception("Failed to save soliq screenshot")
+            # Save the receipt without an image rather than dropping it.
+            logger.exception("Online snapshot render failed")
+
+    # Store the images side by side rather than one after another.
+    async def _store(image: bytes | None, filename: str, **kwargs) -> str | None:
+        if not image:
+            return None
+        try:
+            return await db.save_image(uid, image, filename, **kwargs)
+        except Exception:
+            logger.exception("Failed to save %s", filename)
+            return None
+
+    file_id, qr_file_id, screenshot_file_id = await asyncio.gather(
+        _store(
+            source_image_bytes,
+            f"online_{uid}.png" if online_purchase else f"receipt_{uid}.png",
+        ),
+        _store(qr_image_bytes, f"qr_{uid}.png"),
+        _store(result.screenshot, f"soliq_{uid}.jpg", reencode=False),
+    )
+    stored_images = [file_id, qr_file_id, screenshot_file_id]
+    if file_id is None and not online_purchase:
+        # The user's photo is the one thing we must not lose silently.
+        await db.delete_images(stored_images)
+        raise RuntimeError("could not store the receipt photo")
 
     receipt_doc = {
         "telegram_id": uid,
@@ -389,41 +602,53 @@ async def _save_verified_receipt(
         "soliq_items": data.get("items") or [],
         "soliq_meta": data.get("meta") or {},
     }
+    if online_purchase:
+        receipt_doc["online_purchase"] = True
+    if soliq_fid:
+        receipt_doc["fiscal_id"] = soliq_fid
     try:
         inserted = await db.save_receipt(receipt_doc)
     except db.DuplicateClaimError as e:
+        # Only reachable when two people submit the same receipt in the
+        # same instant (the checks above catch every other case).
+        await db.delete_images(stored_images)
         logger.warning("Double-claim blocked: %s", e)
         await _notify_admins(
             "⚠️ <b>Double-claim blocked</b>\n\n"
-            f"Fiscal receipt: <code>{e.fiscal_id}</code>\n"
+            f"Fiscal receipt: <code>{escape(e.fiscal_id)}</code>\n"
             f"Vendor: {escape(display_vendor or '-')}\n"
             f"VAT: {data.get('vat_amount', 0):,.2f} UZS\n"
             f"Already claimed by user <code>{e.existing_telegram_id}</code>\n"
             f"Rejected attempt by user <code>{e.new_telegram_id}</code>"
         )
-        return (
-            "⛔ This receipt has already been claimed by another employee.\n\n"
-            "Each fiscal receipt can only be refunded once, so it was NOT "
-            "added to your records.\n\n"
-            f"If you believe this is a mistake, contact {config.SUPPORT_CONTACT}.",
-            False,
-        )
+        return SaveOutcome(_double_claim_text())
+    except Exception:
+        await db.delete_images(stored_images)
+        raise
     if inserted is None:
-        return (
-            f"This receipt (#{data.get('receipt_number')}) is already in your records.",
-            False,
+        await db.delete_images(stored_images)
+        return SaveOutcome(
+            f"This receipt (#{escape(str(data.get('receipt_number')))}) "
+            "is already in your records."
         )
 
-    count = await db.count_receipts(uid)
-    return (
-        f"✅ Saved! That's receipt #{count} for you.\n\n"
-        f"Vendor: {display_vendor or '-'}\n"
-        f"Date: {data.get('date', '-')}\n"
-        f"Receipt #: {data.get('receipt_number', '-')}\n"
+    count, total_vat = await db.receipt_totals(uid)
+    logger.info(
+        "Receipt saved for user %s in %.2fs (%s; soliq lookup %s)",
+        uid, time.monotonic() - started,
+        "online purchase" if online_purchase else "photo",
+        "reused" if prefetched else "1 trip",
+    )
+    headline = "✅ Online purchase saved!" if online_purchase else "✅ Saved!"
+    return SaveOutcome(
+        f"{headline} That's receipt #{count} for you.\n\n"
+        f"Vendor: {escape(display_vendor or '-')}\n"
+        f"Date: {escape(str(data.get('date') or '-'))}\n"
+        f"Receipt #: {escape(str(data.get('receipt_number') or '-'))}\n"
         f"Total: {data.get('total_amount', 0):,.2f} UZS\n"
         f"VAT: {data.get('vat_amount', 0):,.2f} UZS\n\n"
-        "Verified by soliq.uz",
-        True,
+        f"Verified by soliq.uz · your VAT total so far: <b>{total_vat:,.2f} UZS</b>",
+        saved=True,
     )
 
 
@@ -448,9 +673,11 @@ async def _require_approved(update: Update) -> bool:
         await db.ensure_approver_user(
             uid, user.full_name or user.username or str(uid)
         )
+        await _show_notice_once(update)
         return True
     status = await db.get_user_status(uid)
     if status == "approved":
+        await _show_notice_once(update)
         return True
     if update.message is None:
         return False
@@ -471,6 +698,41 @@ async def _require_approved(update: Update) -> bool:
             "Tap /start to request access from DT."
         )
     return False
+
+
+# Users known (in this process) to have been shown the licence notice —
+# spares a database write on every message. The database is the record
+# that survives restarts; this is only a shortcut in front of it.
+_notice_seen: set[int] = set()
+
+
+async def _show_notice_once(update: Update) -> None:
+    """Show the open-source licence / no-warranty notice the first time
+    an approved user uses the bot. Once per user, ever: the database
+    remembers (users.notice_shown_at). Never raises and never blocks
+    the command the user actually sent."""
+    uid = update.effective_user.id
+    if uid in _notice_seen or update.message is None:
+        return
+    # Mark before the first await: five photos sent as an album arrive
+    # as five simultaneous updates and must not produce five notices.
+    _notice_seen.add(uid)
+    try:
+        if not await db.claim_notice(uid, notice.NOTICE_VERSION):
+            return  # shown on an earlier day
+        sent = await _safe_reply(
+            update.message, notice.notice_html(),
+            parse_mode="HTML", disable_web_page_preview=True,
+        )
+        if sent is None:
+            # Telegram did not take it — try again on their next message.
+            await db.unclaim_notice(uid)
+            _notice_seen.discard(uid)
+        else:
+            logger.info("Licence notice shown to user %s.", uid)
+    except Exception:
+        logger.exception("Could not show the licence notice to user %s", uid)
+        _notice_seen.discard(uid)
 
 
 async def _send_approval_request(ctx: ContextTypes.DEFAULT_TYPE, requester) -> None:
@@ -580,7 +842,7 @@ async def access_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 # ---------- Commands ----------
 
 _WELCOME_HTML = (
-    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.12.0</b>\n\n"
+    "<b>🇺🇸 Tashkent Embassy VAT Refund — V.13.0</b>\n\n"
     "Hi <b>{first_name}</b>! 👋\n"
     "Just send me a 📸 photo of any receipt — I read the QR and save it.\n\n"
 
@@ -600,9 +862,11 @@ _WELCOME_HTML = (
     "• /cancel_manual — abort a manual entry\n"
     "• /cancel_online — abort an online-purchase entry\n"
     "• /reset — delete all your receipts\n"
-    "• /help — full guide with tips\n\n"
+    "• /help — full guide with tips\n"
+    "• /about — license &amp; disclaimer\n\n"
 
-    "Need help? Contact <b>{support}</b>."
+    "Need help? Contact <b>{support}</b>.\n\n"
+    + notice.WELCOME_FOOTER_HTML
 )
 
 
@@ -619,6 +883,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             _WELCOME_HTML.format(first_name=first_name, support=escape(config.SUPPORT_CONTACT)),
             parse_mode="HTML",
         )
+        await _show_notice_once(update)
         return
 
     status = await db.register_pending_user(
@@ -632,6 +897,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             _WELCOME_HTML.format(first_name=first_name, support=escape(config.SUPPORT_CONTACT)),
             parse_mode="HTML",
         )
+        await _show_notice_once(update)
         return
 
     if status == "denied":
@@ -711,7 +977,8 @@ _HELP_HTML = (
     "/cancel_online — abort an online purchase entry\n"
     "/cancel_pending — discard a pending receipt\n"
     "/reset — delete all your receipts (asks for confirmation)\n"
-    "/whoami — show your Telegram ID\n\n"
+    "/whoami — show your Telegram ID\n"
+    "/about — license and disclaimer (free open-source software, MIT)\n\n"
 
     "Need help? Contact <b>{support}</b>."
 )
@@ -722,6 +989,21 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         _HELP_HTML.format(support=escape(config.SUPPORT_CONTACT)),
         parse_mode="HTML",
         disable_web_page_preview=True,
+    )
+
+
+async def cmd_about(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """The open-source notice plus the full MIT licence text. Open to
+    everyone — there is nothing private in a licence — and counts as
+    having shown the notice, so it is not sent a second time."""
+    uid = update.effective_user.id
+    _notice_seen.add(uid)
+    try:
+        await db.claim_notice(uid, notice.NOTICE_VERSION)
+    except Exception:
+        logger.debug("claim_notice failed in /about", exc_info=True)
+    await update.message.reply_text(
+        notice.about_html(), parse_mode="HTML", disable_web_page_preview=True,
     )
 
 
@@ -818,6 +1100,12 @@ def _sorted_year_keys(groups: dict[str, list[dict]]) -> list[str]:
     return years
 
 
+_NO_NAME_TIP = (
+    "ℹ️ Your name isn't set, so the Employee Name field is blank. "
+    "Run /setname and export again to have it filled in."
+)
+
+
 async def cmd_export_vat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_approved(update):
         return
@@ -838,66 +1126,90 @@ async def cmd_export_vat(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             "The tax office wants one VAT file per year, so I'll send one Excel for each."
         )
 
-    await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
-
     cap = exporter.RECEIPTS_PER_XLSX
+    loop = asyncio.get_running_loop()
+    keepalive = asyncio.create_task(
+        _keep_typing(ctx.bot, update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
+    )
+    try:
+        for year in years:
+            year_receipts = groups[year]
+            n_year = len(year_receipts)
+            year_total = sum(float(r.get("vat_amount") or 0) for r in year_receipts)
 
-    for year in years:
-        year_receipts = groups[year]
-        n_year = len(year_receipts)
-        year_total = sum(float(r.get("vat_amount") or 0) for r in year_receipts)
-
-        # The official template fits cap (120) receipts. If a year goes
-        # past that, split into copy_1, copy_2, ... — each copy keeps the
-        # row numbering continuous so stapled copies read 1..N end-to-end.
-        copies = [
-            year_receipts[i : i + cap] for i in range(0, n_year, cap)
-        ]
-        total_copies = len(copies)
-
-        if total_copies > 1:
-            await update.message.reply_text(
-                f"You have {n_year} receipts for {year} — that's more than "
-                f"the {cap}-row template fits, so I'll split it into "
-                f"{total_copies} workbooks (copy 1 of {total_copies}, "
-                f"copy 2 of {total_copies}, ...). Row numbers stay "
-                "continuous across copies."
-            )
-
-        for copy_idx, chunk in enumerate(copies, 1):
-            start_seq = (copy_idx - 1) * cap + 1
-            end_seq = start_seq + len(chunk) - 1
-            chunk_total = sum(float(r.get("vat_amount") or 0) for r in chunk)
-
-            suffix = f"_copy_{copy_idx}_of_{total_copies}" if total_copies > 1 else ""
-            out_path = (
-                config.TMP_DIR
-                / f"VAT_Refund_{year}{suffix}_{uid}_{uuid.uuid4().hex[:6]}.xlsx"
-            )
-            exporter.build_xlsx_from_receipts(
-                chunk, name, out_path, start_seq=start_seq
-            )
+            # The official template fits cap (120) receipts. If a year goes
+            # past that, split into copy_1, copy_2, ... — each copy keeps the
+            # row numbering continuous so stapled copies read 1..N end-to-end.
+            copies = [
+                year_receipts[i : i + cap] for i in range(0, n_year, cap)
+            ]
+            total_copies = len(copies)
 
             if total_copies > 1:
-                caption = (
-                    f"VAT {year} — copy {copy_idx} of {total_copies}\n"
-                    f"Receipts #{start_seq}–#{end_seq} ({len(chunk)} in this file)\n"
-                    f"This file: {chunk_total:,.2f} UZS\n"
-                    f"Year total ({n_year} receipts): {year_total:,.2f} UZS"
+                await update.message.reply_text(
+                    f"You have {n_year} receipts for {year} — that's more than "
+                    f"the {cap}-row template fits, so I'll split it into "
+                    f"{total_copies} workbooks (copy 1 of {total_copies}, "
+                    f"copy 2 of {total_copies}, ...). Row numbers stay "
+                    "continuous across copies."
                 )
-                filename = f"VAT_Refund_{year}_copy_{copy_idx}_of_{total_copies}.xlsx"
-            else:
-                caption = (
-                    f"VAT for {year} — {len(chunk)} receipt(s) — "
-                    f"Total: {chunk_total:,.2f} UZS"
-                )
-                filename = f"VAT_Refund_{year}.xlsx"
 
-            with open(out_path, "rb") as f:
-                await update.message.reply_document(
-                    document=f, filename=filename, caption=caption,
+            for copy_idx, chunk in enumerate(copies, 1):
+                start_seq = (copy_idx - 1) * cap + 1
+                end_seq = start_seq + len(chunk) - 1
+                chunk_total = sum(float(r.get("vat_amount") or 0) for r in chunk)
+
+                suffix = f"_copy_{copy_idx}_of_{total_copies}" if total_copies > 1 else ""
+                out_path = (
+                    config.TMP_DIR
+                    / f"VAT_Refund_{year}{suffix}_{uid}_{uuid.uuid4().hex[:6]}.xlsx"
                 )
-            out_path.unlink(missing_ok=True)
+                try:
+                    # Off the event loop: filling the workbook is CPU work
+                    # and must not hold up other users' messages.
+                    await loop.run_in_executor(
+                        None,
+                        partial(
+                            exporter.build_xlsx_from_receipts,
+                            chunk, name, out_path, start_seq=start_seq,
+                        ),
+                    )
+
+                    if total_copies > 1:
+                        caption = (
+                            f"VAT {year} — copy {copy_idx} of {total_copies}\n"
+                            f"Receipts #{start_seq}–#{end_seq} ({len(chunk)} in this file)\n"
+                            f"This file: {chunk_total:,.2f} UZS\n"
+                            f"Year total ({n_year} receipts): {year_total:,.2f} UZS"
+                        )
+                        filename = f"VAT_Refund_{year}_copy_{copy_idx}_of_{total_copies}.xlsx"
+                    else:
+                        caption = (
+                            f"VAT for {year} — {len(chunk)} receipt(s) — "
+                            f"Total: {chunk_total:,.2f} UZS"
+                        )
+                        filename = f"VAT_Refund_{year}.xlsx"
+
+                    with open(out_path, "rb") as f:
+                        await update.message.reply_document(
+                            document=f, filename=filename, caption=caption,
+                        )
+                finally:
+                    out_path.unlink(missing_ok=True)
+    except Exception:
+        logger.exception("Excel export failed for user %s", uid)
+        await _safe_reply(
+            update.message,
+            "Sorry — I couldn't finish the Excel export. Your receipts are "
+            "safe; please try /export_vat again in a moment.\n\n"
+            f"Need help? Contact {config.SUPPORT_CONTACT}.",
+        )
+        return
+    finally:
+        await _stop_keepalive(keepalive)
+
+    if not name:
+        await _safe_reply(update.message, _NO_NAME_TIP)
 
 
 async def cmd_export_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -920,46 +1232,135 @@ async def cmd_export_pdf(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             "Sending one receipt-package PDF per year."
         )
 
-    await ctx.bot.send_chat_action(update.effective_chat.id, ChatAction.UPLOAD_DOCUMENT)
+    # Tell the user something is happening: a large package takes a
+    # while to lay out, and silence reads as "the bot is stuck".
+    status = await _safe_reply(
+        update.message,
+        f"Building your PDF package — {len(receipts)} receipt(s), one page each. "
+        "This can take a little while…",
+    )
+    keepalive = asyncio.create_task(
+        _keep_typing(ctx.bot, update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
+    )
+    started = time.monotonic()
+    try:
+        for year in years:
+            year_receipts = groups[year]
+            prefix = f"Receipts_{year}_{uid}_{uuid.uuid4().hex[:6]}"
+            paths = await exporter.build_pdfs_from_receipts(
+                year_receipts, name, config.TMP_DIR, name_prefix=prefix
+            )
+            total_parts = len(paths)
+            total_vat = sum(float(r.get("vat_amount") or 0) for r in year_receipts)
 
-    for year in years:
-        year_receipts = groups[year]
-        prefix = f"Receipts_{year}_{uid}_{uuid.uuid4().hex[:6]}"
-        paths = await exporter.build_pdfs_from_receipts(
-            year_receipts, name, config.TMP_DIR, name_prefix=prefix
+            try:
+                for idx, path in enumerate(paths, 1):
+                    if total_parts > 1:
+                        filename = f"Receipts_{year}_part{idx}_of_{total_parts}.pdf"
+                        caption = (
+                            f"Receipts for {year} — part {idx} of {total_parts} "
+                            f"({len(year_receipts)} receipt(s), total {total_vat:,.2f} UZS)"
+                        )
+                    else:
+                        filename = f"Receipts_{year}.pdf"
+                        caption = (
+                            f"Receipts for {year} — {len(year_receipts)} receipt(s) — "
+                            f"Total: {total_vat:,.2f} UZS"
+                        )
+                    with open(path, "rb") as f:
+                        await update.message.reply_document(
+                            document=f, filename=filename, caption=caption,
+                        )
+            finally:
+                for path in paths:
+                    path.unlink(missing_ok=True)
+    except Exception:
+        logger.exception("PDF export failed for user %s", uid)
+        await _safe_edit(
+            status,
+            "Sorry — I couldn't finish the PDF export. Your receipts are "
+            "safe; please try /export_pdf again in a moment.\n\n"
+            f"Need help? Contact {config.SUPPORT_CONTACT}.",
         )
-        total_parts = len(paths)
-        total_vat = sum(float(r.get("vat_amount") or 0) for r in year_receipts)
+        return
+    finally:
+        await _stop_keepalive(keepalive)
 
-        try:
-            for idx, path in enumerate(paths, 1):
-                if total_parts > 1:
-                    filename = f"Receipts_{year}_part{idx}_of_{total_parts}.pdf"
-                    caption = (
-                        f"Receipts for {year} — part {idx} of {total_parts} "
-                        f"({len(year_receipts)} receipt(s), total {total_vat:,.2f} UZS)"
-                    )
-                else:
-                    filename = f"Receipts_{year}.pdf"
-                    caption = (
-                        f"Receipts for {year} — {len(year_receipts)} receipt(s) — "
-                        f"Total: {total_vat:,.2f} UZS"
-                    )
-                with open(path, "rb") as f:
-                    await update.message.reply_document(
-                        document=f, filename=filename, caption=caption,
-                    )
-        finally:
-            for path in paths:
-                path.unlink(missing_ok=True)
+    logger.info(
+        "PDF export for user %s: %s receipt(s) in %.1fs",
+        uid, len(receipts), time.monotonic() - started,
+    )
+    if status is not None:
+        await _safe_telegram_call(status.delete, "export status cleanup")
+    if not name:
+        await _safe_reply(update.message, _NO_NAME_TIP)
 
 
 async def cmd_reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ask before wiping. /reset sits in the command menu right next to
+    /list and the exports, and it used to delete everything the moment
+    it was tapped — no question, no undo."""
     if not await _require_approved(update):
         return
-    await db.delete_pending_receipt(update.effective_user.id)
-    n = await db.delete_all_receipts(update.effective_user.id)
-    await update.message.reply_text(f"Deleted {n} receipt(s).")
+    uid = update.effective_user.id
+    count, total_vat = await db.receipt_totals(uid)
+    pending = await db.get_pending_receipt(uid)
+    if not count and not pending:
+        await update.message.reply_text("You have no receipts to delete.")
+        return
+    what = (
+        f"all <b>{count}</b> of your receipts ({total_vat:,.2f} UZS of VAT)"
+        if count
+        else "the photo that is waiting for its QR link"
+    )
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🗑 Yes, delete everything", callback_data=f"reset:yes:{uid}"),
+        InlineKeyboardButton("Keep my receipts", callback_data=f"reset:no:{uid}"),
+    ]])
+    await update.message.reply_text(
+        f"⚠️ This will permanently delete {what}.\n\n"
+        "It cannot be undone. If you still need them for a refund claim, "
+        "run /export_vat and /export_pdf first.",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def reset_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the Yes / Keep buttons under the /reset warning."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    try:
+        _, action, owner = query.data.split(":", 2)
+        owner_id = int(owner)
+    except ValueError:
+        await query.answer("Bad request data.", show_alert=True)
+        return
+    uid = query.from_user.id
+    if uid != owner_id:
+        await query.answer("These buttons belong to someone else.", show_alert=True)
+        return
+    if not await _require_approved(update):
+        await query.answer("You no longer have access.", show_alert=True)
+        return
+
+    if action != "yes":
+        await query.answer("Nothing deleted.")
+        await _safe_telegram_call(
+            lambda: query.edit_message_text("Nothing was deleted — your receipts are safe."),
+            "reset cancel edit",
+        )
+        return
+
+    await query.answer("Deleting…")
+    await db.delete_pending_receipt(uid)
+    n = await db.delete_all_receipts(uid)
+    logger.info("User %s reset their records: %s receipt(s) deleted.", uid, n)
+    await _safe_telegram_call(
+        lambda: query.edit_message_text(f"Deleted {n} receipt(s). You can start fresh."),
+        "reset done edit",
+    )
 
 
 async def cmd_cancel_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1006,7 +1407,10 @@ async def _build_heartcheck_report() -> str:
         n_receipts = await db_obj.receipts.count_documents({})
         n_pending = await db_obj.pending_receipts.count_documents({})
         n_manual = await db_obj.receipts.count_documents({"manual": True})
-        today_start = _dt.combine(_dt.now().date(), _dt_time.min)
+        # created_at is stored in UTC; convert local midnight to UTC so
+        # "today" means the Tashkent day, not a window shifted by 5 hours.
+        local_midnight = _dt.combine(_dt.now().date(), _dt_time.min)
+        today_start = local_midnight - (_dt.now() - _dt.utcnow())
         n_today = await db_obj.receipts.count_documents({"created_at": {"$gte": today_start}})
         n_images = await db_obj.fs.files.count_documents({})
         gridfs_bytes = 0
@@ -1053,7 +1457,7 @@ async def _build_heartcheck_report() -> str:
     proxy_note = " (proxy)" if config.SOLIQ_PROXY else ""
 
     return (
-        "<b>🔧 Heartcheck — V.12.0</b>\n\n"
+        "<b>🔧 Heartcheck — V.13.0</b>\n\n"
         f"Status: ✅ alive\n"
         f"Uptime: {uptime_str}\n"
         f"PID: {pid}\n"
@@ -1401,8 +1805,9 @@ async def cmd_cancel_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 # ---------- Online purchase flow ----------
 
 def _looks_like_soliq_url(text: str) -> bool:
-    t = text.strip()
-    return t.startswith("http") and "soliq.uz" in t.lower()
+    """True when the text contains a genuine soliq.uz link (host check,
+    not a substring match — see soliq_url)."""
+    return soliq.find_soliq_url(text) is not None
 
 
 async def cmd_online_purchase(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1416,8 +1821,8 @@ async def cmd_online_purchase(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
 
     # Allow inline URL: /online_purchase https://ofd.soliq.uz/check?...
     if ctx.args:
-        url = " ".join(ctx.args).strip()
-        if _looks_like_soliq_url(url):
+        url = soliq.find_soliq_url(" ".join(ctx.args))
+        if url:
             await _save_online_purchase(update, ctx, url)
             return
 
@@ -1444,113 +1849,25 @@ async def cmd_cancel_online(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> N
 async def _save_online_purchase(
     update: Update, ctx: ContextTypes.DEFAULT_TYPE, qr_url: str
 ) -> None:
+    """Save a receipt from a pasted soliq.uz link (no photo). Verified
+    data, the snapshot image and the soliq.uz page screenshot all come
+    from a single lookup — this path used to open the page twice."""
     uid = update.effective_user.id
     status = await _safe_reply(update.message, "Fetching verified data from soliq.uz...")
-
-    data, diag = await soliq.fetch_receipt_with_diag(qr_url)
-    if not data:
-        await _safe_edit(status,
-            "I could not fetch data from soliq.uz for that URL.\n\n"
-            f"Reason: {diag}\n\n"
-            f"Need help? Contact {config.SUPPORT_CONTACT}."
-        )
-        return
-
-    if not data.get("vat_amount"):
-        vendor = data.get("vendor", "") or data.get("receipt_number", "this receipt")
-        await _safe_edit(status,
-            f"This receipt ({vendor}) has 0 VAT — nothing to refund.\n"
-            "It will not be added to your records."
-        )
-        return
-
-    receipt_no = data.get("receipt_number", "")
-    existing = await db.find_receipt_by_number(uid, receipt_no)
-    if existing:
-        await _safe_edit(status,
-            f"This receipt (#{receipt_no}) is already in your records — "
-            f"saved on {existing.get('created_at', '?')}."
-        )
-        return
-
-    # Build the synthetic snapshot and save it as the receipt's image.
-    loop = asyncio.get_running_loop()
     try:
-        png_bytes = await loop.run_in_executor(
-            None, online_snapshot.render_online_receipt_png, data, qr_url
+        outcome = await _save_verified_receipt(
+            uid=uid,
+            source_image_bytes=None,
+            qr_url=soliq.find_soliq_url(qr_url) or qr_url,
+            loop=asyncio.get_running_loop(),
+            pasted_link=True,
+            online_purchase=True,
         )
-        file_id = await db.save_image(uid, png_bytes, f"online_{uid}.png")
     except Exception:
-        logger.exception("Online snapshot render/save failed")
-        # Save the receipt without an image rather than dropping the entry.
-        file_id = None
-
-    # Capture the soliq.uz page for the PDF export. Non-fatal on failure.
-    # capture() returns (png, api_data); the api_data was already used
-    # upstream via fetch_receipt_with_diag → we discard it here.
-    screenshot_file_id = None
-    try:
-        screenshot_bytes, _ = await soliq_screenshot.capture(qr_url)
-        if screenshot_bytes:
-            screenshot_file_id = await db.save_image(
-                uid, screenshot_bytes, f"soliq_{uid}.jpg"
-            )
-    except Exception:
-        logger.exception("Failed to capture/save soliq screenshot (online)")
-
-    receipt_doc = {
-        "telegram_id": uid,
-        "image_file_id": file_id,
-        "qr_image_file_id": None,
-        "soliq_screenshot_file_id": screenshot_file_id,
-        "date": data.get("date", ""),
-        "vendor": data.get("vendor", ""),
-        "printed_vendor": "",
-        "display_vendor": data.get("vendor", ""),
-        "receipt_number": receipt_no,
-        "vat_amount": data.get("vat_amount", 0.0),
-        "total_amount": data.get("total_amount", 0.0),
-        "soliq_url": qr_url,
-        "raw_qr": qr_url,
-        "online_purchase": True,
-        "soliq_items": data.get("items") or [],
-        "soliq_meta": data.get("meta") or {},
-    }
-    try:
-        inserted = await db.save_receipt(receipt_doc)
-    except db.DuplicateClaimError as e:
-        logger.warning("Double-claim blocked (online): %s", e)
-        await _notify_admins(
-            "⚠️ <b>Double-claim blocked</b> (online purchase)\n\n"
-            f"Fiscal receipt: <code>{e.fiscal_id}</code>\n"
-            f"Vendor: {escape(data.get('vendor', '-') or '-')}\n"
-            f"VAT: {data.get('vat_amount', 0):,.2f} UZS\n"
-            f"Already claimed by user <code>{e.existing_telegram_id}</code>\n"
-            f"Rejected attempt by user <code>{e.new_telegram_id}</code>"
-        )
-        await _safe_edit(status,
-            "⛔ This receipt has already been claimed by another employee.\n\n"
-            "Each fiscal receipt can only be refunded once, so it was NOT "
-            "added to your records.\n\n"
-            f"If you believe this is a mistake, contact {config.SUPPORT_CONTACT}."
-        )
+        logger.exception("Online purchase save crashed for user %s", uid)
+        await _safe_edit(status, _crash_text("this link"))
         return
-    if inserted is None:
-        await _safe_edit(status,
-            f"This receipt (#{receipt_no}) is already in your records."
-        )
-        return
-
-    count = await db.count_receipts(uid)
-    await _safe_edit(status,
-        f"✅ Online purchase saved! That's receipt #{count} for you.\n\n"
-        f"Vendor: {data.get('vendor', '-') or '-'}\n"
-        f"Date: {data.get('date', '-')}\n"
-        f"Receipt #: {receipt_no or '-'}\n"
-        f"Total: {data.get('total_amount', 0):,.2f} UZS\n"
-        f"VAT: {data.get('vat_amount', 0):,.2f} UZS\n\n"
-        "Verified by soliq.uz"
-    )
+    await _safe_edit(status, outcome.message, parse_mode="HTML")
 
 
 async def _handle_manual_step(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -1672,23 +1989,20 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await db.upsert_user(uid, update.effective_user.full_name or "")
 
     photo = msg.photo[-1] if msg.photo else None
-    if (
-        not photo
-        and msg.document
+    is_image_document = bool(
+        msg.document
         and msg.document.mime_type
         and msg.document.mime_type.startswith("image/")
-    ):
-        tg_file = await msg.document.get_file()
-    elif photo:
-        tg_file = await photo.get_file()
-    else:
+    )
+    if not photo and not is_image_document:
         return
 
     # Cosmetic typing ping + initial status message — both wrapped so a
     # flood-control RetryAfter or transient network error during a busy
     # burst can't abort photo processing. The receipt save runs even if
     # both fail; status will just be None and downstream edits will
-    # silently no-op.
+    # silently no-op. Sent BEFORE asking Telegram for the file so the
+    # user gets an immediate sign of life.
     await _safe_telegram_call(
         lambda: ctx.bot.send_chat_action(msg.chat_id, ChatAction.TYPING),
         "send_chat_action",
@@ -1696,22 +2010,33 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     status = await _safe_reply(msg, "Got it, processing...")
 
     # Keep the "is typing..." indicator alive for the full duration of
-    # processing — long receipts can spend 5-15 seconds in OCR fallback
-    # plus multiple soliq.uz round-trips, well past Telegram's ~5s
-    # auto-timeout on chat actions. Without this, users see the
-    # "processing..." status sit silent and assume the bot is hung.
+    # processing — an unreadable photo can take ~10 s of QR search plus
+    # the OCR fallback, well past Telegram's ~5s auto-timeout on chat
+    # actions. Without this, users see the "processing..." status sit
+    # silent and assume the bot is hung.
     typing_task = asyncio.create_task(_keep_typing(ctx.bot, msg.chat_id))
     try:
+        try:
+            tg_file = await (
+                photo.get_file() if photo else msg.document.get_file()
+            )
+        except Exception:
+            logger.exception("Could not get the file from Telegram")
+            await _safe_edit(
+                status,
+                "I couldn't download that image from Telegram. Please send it again.",
+            )
+            return
         await _process_photo(
             update=update, ctx=ctx, msg=msg, uid=uid,
             tg_file=tg_file, status=status,
         )
+    except Exception:
+        # Last line of defence: whatever broke, the user gets an answer.
+        logger.exception("Photo processing crashed for user %s", uid)
+        await _safe_edit(status, _crash_text("this photo"))
     finally:
-        typing_task.cancel()
-        try:
-            await typing_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        await _stop_keepalive(typing_task)
 
 
 async def _process_photo(
@@ -1725,18 +2050,23 @@ async def _process_photo(
 ) -> None:
     """Body of the photo handler — extracted so handle_photo can wrap it
     in a typing-keepalive try/finally without indenting the whole block."""
+    started = time.monotonic()
     try:
         image_bytes = bytes(await tg_file.download_as_bytearray())
-    except Exception as e:
+    except Exception:
         logger.exception("Download failed")
-        await _safe_edit(status, f"Could not download the image: {e}")
+        await _safe_edit(
+            status,
+            "I couldn't download that image from Telegram. Please send it again.",
+        )
         return
+    downloaded = time.monotonic()
 
-    debug_dir = None
-    debug_id = uuid.uuid4().hex[:6]
+    on_crop = None
     if SAVE_DEBUG_IMAGES:
         debug_dir = Path("debug_images")
         debug_dir.mkdir(exist_ok=True)
+        debug_id = uuid.uuid4().hex[:6]
         ext = (
             ".heic"
             if (
@@ -1750,61 +2080,63 @@ async def _process_photo(
         raw_path.write_bytes(image_bytes)
         logger.info("Saved raw image: %s (%s bytes)", raw_path, len(image_bytes))
 
+        def _save_debug_crop(cropped) -> None:
+            (debug_dir / f"crop_{uid}_{debug_id}.png").write_bytes(
+                receipt_image._to_png_bytes(cropped)
+            )
+
+        on_crop = _save_debug_crop
+
     loop = asyncio.get_running_loop()
 
-    # Run DB lookup and image crop in parallel — they're fully independent
-    pending, crop_result = await asyncio.gather(
+    # Look up any pending (unscanned) photo while the QR search runs.
+    pending, decoded = await asyncio.gather(
         db.get_pending_receipt(uid),
-        loop.run_in_executor(None, receipt_image.auto_crop_receipt, image_bytes),
+        _decode_qr(loop, image_bytes, on_crop),
         return_exceptions=True,
     )
-    if isinstance(pending, Exception):
+    if isinstance(pending, BaseException):
         pending = None
-    if isinstance(crop_result, Exception):
-        logger.exception("Crop failed: %s", crop_result)
-        cropped_bytes = image_bytes
+    if isinstance(decoded, BaseException):
+        logger.error("QR decode raised", exc_info=decoded)
+        qr_url = None
     else:
-        cropped_bytes = crop_result
-        if debug_dir is not None:
-            (debug_dir / f"crop_{uid}_{debug_id}.png").write_bytes(cropped_bytes)
-        logger.info("Cropped image: %s bytes", len(cropped_bytes))
+        qr_url, _how = decoded
+    searched = time.monotonic()
 
-    qr_url = await _decode_qr(loop, image_bytes, cropped_bytes)
-
-    # OCR fallback: long receipts often have the QR too small for zxing
-    # to lock onto, but the URL is printed in plain text right next to
-    # the QR and OCR can usually read it. We try each candidate against
-    # soliq.uz — the first one that returns valid data wins. If none
-    # validate, we fall through to the existing pending-receipt flow,
-    # so worst case behavior is identical to before.
+    # OCR fallback: long receipts often have the QR too small for the
+    # decoders to lock onto, but the URL is printed in plain text right
+    # next to the QR and OCR can usually read it. We try each candidate
+    # against soliq.uz — the first one that returns valid data wins. If
+    # none validate, we fall through to the pending-receipt flow.
+    #
+    # One OCR read answers both "is there a printed link?" and "is this
+    # even a fiscal receipt?", and the soliq answer that validates a
+    # candidate is kept and reused for the save (it used to be fetched
+    # again from scratch).
     ocr_recovered = False
+    prefetched = None
+    classification: dict = {"kind": "unknown"}
     if not qr_url:
-        # Tell the user we're still working — OCR + multiple soliq round
-        # trips can take a few seconds on long receipts. The typing
-        # indicator is alive too, but a concrete message reassures users
-        # who have learned to ignore the typing dots.
+        await _safe_edit(status, "QR is small — scanning the receipt text...")
         try:
-            await _safe_edit(status, "QR is small — scanning the receipt text...")
-        except Exception:
-            pass
-        try:
-            candidates = await loop.run_in_executor(
-                None, receipt_ocr.extract_soliq_url_candidates, image_bytes
+            analysis = await loop.run_in_executor(
+                None, receipt_ocr.analyze_unreadable, image_bytes
             )
         except Exception:
-            logger.exception("OCR fallback: candidate extraction failed")
-            candidates = []
-        for candidate in candidates:
-            try:
-                test_data = await soliq.fetch_receipt_data(candidate)
-            except Exception:
-                logger.exception("OCR fallback: soliq fetch crashed for %s", candidate)
-                test_data = None
-            if test_data and test_data.get("vat_amount"):
+            logger.exception("OCR fallback failed")
+            analysis = {}
+        classification = analysis.get("classification") or classification
+        for candidate in analysis.get("candidates") or []:
+            result = await soliq.fetch_receipt(candidate, want_screenshot=True)
+            if result.data and result.data.get("vat_amount"):
                 qr_url = candidate
+                prefetched = result
                 ocr_recovered = True
                 logger.info("OCR fallback recovered URL: %s", candidate)
                 break
+            if result.reason == "unreachable":
+                break  # soliq is down — more guesses won't fare better
 
     # Each photo is treated as its own receipt attempt. We never merge a
     # new photo's decoded QR with the pending receipt's image — that path
@@ -1815,14 +2147,6 @@ async def _process_photo(
     #   - /cancel_pending (give up and start over)
 
     if not qr_url:
-        try:
-            classification = await loop.run_in_executor(
-                None, receipt_ocr.classify_document, cropped_bytes
-            )
-        except Exception:
-            logger.exception("Receipt classification failed")
-            classification = {"kind": "unknown"}
-
         if classification.get("kind") == "payment_slip":
             vendor = classification.get("vendor") or "this merchant"
             await _safe_edit(status,
@@ -1852,23 +2176,30 @@ async def _process_photo(
                 "please send it again later.\n\n"
             ) + msg_text
         await _safe_edit(status, msg_text, parse_mode="HTML")
+        logger.info(
+            "Photo from user %s: no QR (download %.2fs, search %.2fs, total %.2fs)",
+            uid, downloaded - started, searched - downloaded,
+            time.monotonic() - started,
+        )
         return
 
     if ocr_recovered:
         await _safe_edit(status,
             "QR was hard to read — recovered the link from the receipt's "
-            "printed text instead. Fetching verified data from soliq.uz..."
+            "printed text instead. Saving..."
         )
     else:
         await _safe_edit(status, "QR found. Fetching verified data from soliq.uz...")
     # Save the ORIGINAL bytes (not the crop) so the stored receipt always
     # has maximum detail. The crop is only a processing step for QR decode.
-    message, saved = await _save_verified_receipt(
+    outcome = await _save_verified_receipt(
         uid=uid,
         source_image_bytes=image_bytes,
         qr_url=qr_url,
         loop=loop,
+        prefetched=prefetched,
     )
+    message = outcome.message
     # Any successful save silently clears the pending receipt — most of the
     # time it's the user retaking the same receipt (image-hash detection
     # turned out to be unreliable on real phone photos). Trade-off: a user
@@ -1876,7 +2207,7 @@ async def _process_photo(
     # unrelated one loses the failed one's photo. We append a short, plain
     # note so they at least know the old pending is gone — short enough
     # that the retake case can ignore it without feeling nagged.
-    if saved and pending:
+    if outcome.saved and pending:
         try:
             await db.delete_pending_receipt(uid)
         except Exception:
@@ -1886,7 +2217,21 @@ async def _process_photo(
             "If it was a different receipt, retake it or paste its "
             "soliq.uz QR link.)"
         )
-    await _safe_edit(status, message)
+    await _safe_edit(status, message, parse_mode="HTML")
+    logger.info(
+        "Photo from user %s handled in %.2fs (download %.2fs, QR search %.2fs, "
+        "soliq+save %.2fs) -> %s",
+        uid, time.monotonic() - started, downloaded - started,
+        searched - downloaded, time.monotonic() - searched,
+        "saved" if outcome.saved else ("not saved" if outcome.resolved else "soliq lookup failed"),
+    )
+
+
+_NUDGE_TEXT = (
+    "To add a receipt, send me a 📸 photo of it (or of just its QR code), "
+    "or paste its soliq.uz link.\n\n"
+    "/list shows what you've saved · /help explains everything."
+)
 
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1905,6 +2250,10 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await _handle_manual_step(update, ctx, text)
         return
 
+    # A soliq.uz link anywhere in the message ("here it is: https://...").
+    # Host-checked, so only genuine soliq.uz links count.
+    link = soliq.find_soliq_url(text)
+
     # /online_purchase mode — next message is the soliq.uz URL.
     if ctx.user_data.get("awaiting_online_url"):
         ctx.user_data.pop("awaiting_online_url", None)
@@ -1913,13 +2262,13 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 "Online purchase entry cancelled (you sent a command)."
             )
             return
-        if not _looks_like_soliq_url(text):
+        if not link:
             await update.message.reply_text(
                 "That didn't look like a soliq.uz URL. Cancelled.\n\n"
                 "Run /online_purchase again and paste the link."
             )
             return
-        await _save_online_purchase(update, ctx, text)
+        await _save_online_purchase(update, ctx, link)
         return
 
     # If the user clicked /setname (no args), their next plain-text message
@@ -1944,17 +2293,19 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Soliq.uz URL paste with no pending photo: just save it as an online
     # purchase. Whether the user ran /online_purchase first or pasted the
     # link directly, the intent is the same — they want this URL turned
-    # into a saved receipt and they have no photo to attach. The save
-    # function already handles "already saved" / "0 VAT" / fetch-failure
-    # branches, so this is a single unified path.
-    if not pending and _looks_like_soliq_url(text):
-        await _save_online_purchase(update, ctx, text)
+    # into a saved receipt and they have no photo to attach.
+    if not pending and link:
+        await _save_online_purchase(update, ctx, link)
         return
 
     if not pending:
+        # Plain chat with nothing in progress. The bot used to stay
+        # silent here, which reads as "it's broken" — answer with the
+        # one thing people need to know.
+        await update.message.reply_text(_NUDGE_TEXT)
         return
 
-    if "soliq.uz" not in text.lower():
+    if not link:
         await update.message.reply_text(
             "I'm waiting for:\n"
             "• A close-up photo of the QR code\n"
@@ -1986,16 +2337,34 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     loop = asyncio.get_running_loop()
-    message, saved = await _save_verified_receipt(
-        uid=uid,
-        source_image_bytes=pending_image_bytes,
-        qr_url=text,
-        loop=loop,
-    )
-    await db.delete_pending_receipt(uid)
-    if saved:
-        message += "\n\nReceipt completed using the link you pasted."
-    await _safe_edit(status, message)
+    try:
+        outcome = await _save_verified_receipt(
+            uid=uid,
+            source_image_bytes=pending_image_bytes,
+            qr_url=link,
+            loop=loop,
+            pasted_link=True,
+        )
+    except Exception:
+        logger.exception("Completing pending receipt crashed for user %s", uid)
+        await _safe_edit(status, _crash_text("this link"))
+        return
+
+    message = outcome.message
+    if outcome.resolved:
+        # Saved, duplicate or zero-VAT: this receipt's story is over.
+        await db.delete_pending_receipt(uid)
+        if outcome.saved:
+            message += "\n\nReceipt completed using the link you pasted."
+    else:
+        # soliq could not be asked (down / receipt not there yet / bad
+        # link). Keep the photo so the user can simply paste again —
+        # it used to be thrown away here, forcing a re-take.
+        message += (
+            "\n\nI kept your photo — paste the link again to retry, "
+            "or /cancel_pending to discard it."
+        )
+    await _safe_edit(status, message, parse_mode="HTML")
 
 
 # ---------- App setup ----------
@@ -2013,6 +2382,7 @@ _BOT_COMMANDS = [
     BotCommand("cancel_online", "Abort an online-purchase entry in progress"),
     BotCommand("reset", "Delete everything"),
     BotCommand("help", "Show help"),
+    BotCommand("about", "License and disclaimer"),
 ]
 
 
@@ -2117,22 +2487,38 @@ async def _post_shutdown(app: Application) -> None:
 
 
 def _build_app() -> Application:
+    # Everything the bot SENDS (replies, edits, files, downloads) goes
+    # through ResilientRequest: when a connection to Telegram cannot be
+    # opened it tries again for about a minute and a half instead of
+    # dropping the reply after one attempt. A shorter connect timeout
+    # (10 s, was 30 s) makes each attempt fail fast so the next can start.
+    send_request = ResilientRequest(
+        connection_pool_size=256,
+        connect_timeout=10.0,
+        read_timeout=40.0,
+        write_timeout=40.0,
+        pool_timeout=30.0,
+    )
+    # Generous long-poll timeouts — WiFi jitters on cafe/hotel networks
+    # caused httpx.ConnectError bursts during get_updates. Polling has
+    # its own retry loop, so it keeps the stock request class. (Once a
+    # request instance is given, the builder insists on instances for
+    # both — the per-timeout builder methods can no longer be used.)
+    polling_request = HTTPXRequest(
+        connection_pool_size=1,
+        connect_timeout=30.0,
+        read_timeout=40.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
+    )
     app = (
         Application.builder()
         .token(config.TELEGRAM_BOT_TOKEN)
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
         .concurrent_updates(True)
-        # Generous long-poll timeouts — WiFi jitters on cafe/hotel networks
-        # caused httpx.ConnectError bursts during get_updates.
-        .get_updates_connect_timeout(30.0)
-        .get_updates_read_timeout(40.0)
-        .get_updates_write_timeout(30.0)
-        .get_updates_pool_timeout(30.0)
-        .connect_timeout(30.0)
-        .read_timeout(40.0)
-        .write_timeout(40.0)
-        .pool_timeout(30.0)
+        .request(send_request)
+        .get_updates_request(polling_request)
         .build()
     )
 
@@ -2141,6 +2527,7 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+    app.add_handler(CommandHandler("about", cmd_about))
     app.add_handler(CommandHandler("setname", cmd_setname))
     app.add_handler(CommandHandler("manual", cmd_manual))
     app.add_handler(CommandHandler("cancel_manual", cmd_cancel_manual))
@@ -2161,6 +2548,8 @@ def _build_app() -> Application:
     app.add_handler(CommandHandler("deny", cmd_deny))
     # Inline Approve/Deny buttons on the new-user notification messages.
     app.add_handler(CallbackQueryHandler(access_callback, pattern=r"^access:"))
+    # Yes / Keep buttons under the /reset confirmation.
+    app.add_handler(CallbackQueryHandler(reset_callback, pattern=r"^reset:"))
 
     # filters.UpdateType.MESSAGE restricts these to genuinely new
     # messages. Without it PTB also routes edited_message (and channel
@@ -2212,6 +2601,13 @@ def main() -> None:
     # rebuild. Exponential backoff caps at 60 s.
     backoff = 5
     while True:
+        # run_polling() CLOSES the event loop it ran on. Without a new
+        # one, the second pass through this loop dies instantly with
+        # "Event loop is closed" — every time, forever — so the
+        # auto-restart this loop exists for could never actually work:
+        # the process would sit there alive but deaf, and launchd would
+        # not step in because nothing had exited.
+        asyncio.set_event_loop(asyncio.new_event_loop())
         app = _build_app()
         logger.info("Bot polling...")
         try:

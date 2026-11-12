@@ -122,9 +122,7 @@ async def ensure_indexes() -> None:
     await db.users.create_index("telegram_id", unique=True)
     await db.users.create_index("status")
     await db.receipts.create_index([("telegram_id", 1), ("created_at", -1)])
-    await db.receipts.create_index(
-        [("telegram_id", 1), ("receipt_number", 1)], unique=True, sparse=True
-    )
+    await _ensure_receipt_number_index(db)
     await db.pending_receipts.create_index("telegram_id", unique=True)
     await db.pending_receipts.create_index("expires_at", expireAfterSeconds=0)
     # Audit trail for /reset deletions. Queried by /report for
@@ -156,6 +154,54 @@ async def ensure_indexes() -> None:
             "duplicates and restart to upgrade."
         )
         await db.receipts.create_index("fiscal_id", name="fiscal_id_lookup")
+
+
+_LEGACY_NUMBER_INDEX = "telegram_id_1_receipt_number_1"
+_MANUAL_NUMBER_INDEX = "manual_receipt_number_unique"
+
+
+async def _ensure_receipt_number_index(db) -> None:
+    """Per-user uniqueness of the receipt NUMBER — for manual entries only.
+
+    Until V.13 this was a unique index over every receipt: one user
+    could not hold two receipts with the same number. But a receipt
+    number is just a cash terminal's own counter, so two unrelated
+    receipts from two shops can share one — and the second was refused
+    as "already in your records". In the Nov 2026 data 36 numbers were
+    in use by more than one terminal; for a user with 200+ receipts the
+    odds of having lost a legitimate receipt this way were about 1 in 6.
+
+    Receipts read from a QR/link don't need this rule: they carry a
+    fiscal identity (terminal + number + timestamp + sign) with its own
+    unique index. Hand-typed entries have nothing else to go by, so the
+    rule stays for them — enforced by this partial index and by the
+    number checks in save_receipt.
+
+    ROLLING BACK to pre-V.13 code: that code recreates the old index at
+    startup, which fails (and stops the bot from starting) as soon as
+    any user holds two receipts with the same number. See HANDOVER.md.
+    """
+    try:
+        existing = await db.receipts.index_information()
+        legacy = existing.get(_LEGACY_NUMBER_INDEX)
+        if legacy is not None and legacy.get("unique"):
+            await db.receipts.drop_index(_LEGACY_NUMBER_INDEX)
+            logger.info(
+                "Dropped the all-receipts unique index on (user, receipt "
+                "number); the rule now applies to manual entries only."
+            )
+        await db.receipts.create_index(
+            [("telegram_id", 1), ("receipt_number", 1)],
+            unique=True,
+            partialFilterExpression={"manual": True},
+            name=_MANUAL_NUMBER_INDEX,
+        )
+    except Exception:
+        # Not fatal: save_receipt's own number checks still apply.
+        logger.exception(
+            "Could not set up the manual-entry receipt-number index; "
+            "continuing with application-level checks only."
+        )
 
 
 async def migrate_backfill_fiscal_ids() -> int:
@@ -310,6 +356,29 @@ async def ensure_approver_user(telegram_id: int, name: str) -> None:
     )
 
 
+async def claim_notice(telegram_id: int, version: int) -> bool:
+    """Record that this user is being shown the licence / no-warranty
+    notice. Returns True exactly once per user — the caller sends the
+    notice only then. Atomic, so several messages arriving together
+    (a photo album) cannot each win."""
+    db = get_db()
+    result = await db.users.update_one(
+        {"telegram_id": telegram_id, "notice_shown_at": {"$exists": False}},
+        {"$set": {"notice_shown_at": datetime.utcnow(), "notice_version": version}},
+    )
+    return result.modified_count == 1
+
+
+async def unclaim_notice(telegram_id: int) -> None:
+    """Undo claim_notice when the notice could not actually be sent, so
+    the user is shown it on their next message instead of never."""
+    db = get_db()
+    await db.users.update_one(
+        {"telegram_id": telegram_id},
+        {"$unset": {"notice_shown_at": "", "notice_version": ""}},
+    )
+
+
 async def get_user(telegram_id: int) -> Optional[dict]:
     db = get_db()
     return await db.users.find_one({"telegram_id": telegram_id})
@@ -324,15 +393,26 @@ async def set_user_name(telegram_id: int, name: str) -> None:
     )
 
 
-async def save_image(telegram_id: int, image_bytes: bytes, filename: str) -> str:
+async def save_image(
+    telegram_id: int, image_bytes: bytes, filename: str, *, reencode: bool = True
+) -> str:
     """Re-encode to JPEG and save to GridFS. Returns the file id as str.
 
     Accepts any image format the bot receives (iPhone HEIC, Telegram JPEG,
     OpenCV PNG). Storing as JPEG keeps the on-disk footprint small so the
     Mac SSD can host many users.
+
+    `reencode=False` stores the bytes untouched. Only for JPEGs the bot
+    produced itself (the soliq.uz screenshot): decoding and re-compressing
+    those costs time and a little sharpness for nothing. User photos are
+    always re-encoded — that is also what strips their EXIF metadata
+    (camera model, GPS position) before storage.
     """
-    loop = asyncio.get_running_loop()
-    jpeg_bytes = await loop.run_in_executor(None, _to_jpeg_bytes, image_bytes)
+    if reencode or image_bytes[:3] != b"\xff\xd8\xff":
+        loop = asyncio.get_running_loop()
+        jpeg_bytes = await loop.run_in_executor(None, _to_jpeg_bytes, image_bytes)
+    else:
+        jpeg_bytes = image_bytes
 
     if not filename.lower().endswith((".jpg", ".jpeg")):
         root = filename.rsplit(".", 1)[0] if "." in filename else filename
@@ -398,7 +478,8 @@ async def detach_pending_receipt(telegram_id: int) -> int:
 
 async def save_receipt(doc: dict) -> Optional[str]:
     """Insert a receipt. Returns inserted id, or None when the SAME user
-    already has this receipt saved.
+    already has this receipt saved (same fiscal identity, or — where a
+    hand-typed entry is involved — same receipt number).
 
     Raises DuplicateClaimError when a DIFFERENT user has already claimed
     the same fiscal receipt (matched on the QR's terminal/receipt#/
@@ -409,11 +490,19 @@ async def save_receipt(doc: dict) -> Optional[str]:
     db = get_db()
     doc = {**doc, "created_at": datetime.utcnow()}
 
-    fid = fiscal_id_from_url(doc.get("soliq_url") or doc.get("raw_qr") or "")
+    # Identity: the one soliq itself reported (doc["fiscal_id"], set by
+    # the caller from the verified data) wins over the one read off the
+    # link, because link parameters can be altered without soliq
+    # minding — see soliq._canonical_fiscal_id. Both are checked, so a
+    # receipt stored under either form is recognised.
+    url_fid = fiscal_id_from_url(doc.get("soliq_url") or doc.get("raw_qr") or "")
+    fid = doc.get("fiscal_id") or url_fid
+    doc.pop("fiscal_id", None)
     if fid:
         doc["fiscal_id"] = fid
         existing = await db.receipts.find_one(
-            {"fiscal_id": fid}, {"telegram_id": 1}
+            {"fiscal_id": {"$in": list(dict.fromkeys([fid, url_fid or fid]))}},
+            {"telegram_id": 1},
         )
         if existing:
             if existing.get("telegram_id") != doc.get("telegram_id"):
@@ -422,13 +511,30 @@ async def save_receipt(doc: dict) -> Optional[str]:
                 )
             return None  # same user re-scanning their own receipt
 
+    # Receipt-NUMBER rule (per user). The number alone identifies a
+    # receipt only when there is nothing better to go by:
+    #   * a hand-typed entry (or any receipt without a fiscal identity)
+    #     may not reuse a number the user already has;
+    #   * a QR/link receipt may not reuse the number of one of the
+    #     user's hand-typed entries — that is how the same paper receipt
+    #     would otherwise be claimed twice, once typed and once scanned.
+    # Two QR/link receipts with the same number are simply two receipts
+    # from two different shops; their fiscal identities tell them apart.
+    number = doc.get("receipt_number")
+    if number:
+        clash_filter = {"telegram_id": doc.get("telegram_id"), "receipt_number": number}
+        if fid and not doc.get("manual"):
+            clash_filter["manual"] = True
+        if await db.receipts.find_one(clash_filter, {"_id": 1}):
+            return None
+
     try:
         result = await db.receipts.insert_one(doc)
         return str(result.inserted_id)
     except Exception as e:
-        # Duplicate key on (telegram_id, receipt_number) — manual entries
-        # have no fiscal_id, so this per-user index is their only guard —
-        # or on fiscal_id_unique if two saves raced past the find_one.
+        # Duplicate key on the manual-entry number index (two identical
+        # manual entries racing past the check above), or on
+        # fiscal_id_unique if two saves raced past the find_one.
         msg = str(e).lower()
         if "duplicate key" in msg:
             if fid and "fiscal_id" in msg:
@@ -456,9 +562,51 @@ async def find_receipt_by_number(telegram_id: int, receipt_number: str) -> Optio
 
 
 async def list_receipts(telegram_id: int) -> list[dict]:
+    """A user's receipts, oldest receipt date first.
+
+    The tie-breakers matter: /export_vat and /export_pdf each call this
+    separately and number the rows 1..N. Sorting by date alone leaves the
+    order of same-day receipts up to MongoDB, so row 17 in the Excel form
+    was not guaranteed to be receipt 17 in the PDF."""
     db = get_db()
-    cursor = db.receipts.find({"telegram_id": telegram_id}).sort("date", 1)
+    cursor = db.receipts.find({"telegram_id": telegram_id}).sort(
+        [("date", 1), ("created_at", 1), ("_id", 1)]
+    )
     return [doc async for doc in cursor]
+
+
+async def receipt_totals(telegram_id: int) -> tuple[int, float]:
+    """(number of receipts, total VAT in UZS) for one user."""
+    db = get_db()
+    rows = await db.receipts.aggregate([
+        {"$match": {"telegram_id": telegram_id}},
+        {"$group": {
+            "_id": None,
+            "count": {"$sum": 1},
+            "vat": {"$sum": {"$ifNull": ["$vat_amount", 0]}},
+        }},
+    ]).to_list(1)
+    if not rows:
+        return 0, 0.0
+    return int(rows[0]["count"] or 0), float(rows[0]["vat"] or 0)
+
+
+async def find_receipt_by_fiscal_id(*fiscal_ids: Optional[str]) -> Optional[dict]:
+    """Who (if anyone) already holds this fiscal receipt. Lets the bot
+    answer "already saved" / "already claimed" straight from the QR
+    link, before spending a soliq.uz lookup on it. Accepts several
+    candidate ids (link-derived and soliq-reported)."""
+    ids = [f for f in dict.fromkeys(fiscal_ids) if f]
+    if not ids:
+        return None
+    db = get_db()
+    return await db.receipts.find_one(
+        {"fiscal_id": {"$in": ids}},
+        {
+            "telegram_id": 1, "receipt_number": 1, "created_at": 1,
+            "vendor": 1, "display_vendor": 1, "vat_amount": 1,
+        },
+    )
 
 
 async def count_receipts(telegram_id: int) -> int:
@@ -522,6 +670,59 @@ async def get_image(file_id: str) -> bytes:
     fs = get_fs()
     stream = await fs.open_download_stream(ObjectId(file_id))
     return await stream.read()
+
+
+async def get_images(file_ids: list[str], concurrency: int = 8) -> dict[str, bytes]:
+    """Load several GridFS images at once. Missing or unreadable files
+    are simply absent from the result — callers fall back per image."""
+    sem = asyncio.Semaphore(concurrency)
+    out: dict[str, bytes] = {}
+
+    async def _one(file_id: str) -> None:
+        async with sem:
+            try:
+                out[file_id] = await get_image(file_id)
+            except Exception:
+                logger.warning("Could not load image %s", file_id, exc_info=True)
+
+    await asyncio.gather(*(_one(f) for f in dict.fromkeys(file_ids) if f))
+    return out
+
+
+async def image_sizes(file_ids: list[Optional[str]]) -> dict[str, int]:
+    """Stored size in bytes of each GridFS image (one query, no image
+    data read). Unknown ids are simply absent."""
+    from bson import ObjectId
+    oids = []
+    for file_id in file_ids:
+        if not file_id:
+            continue
+        try:
+            oids.append(ObjectId(file_id))
+        except Exception:
+            continue
+    if not oids:
+        return {}
+    db = get_db()
+    return {
+        str(doc["_id"]): int(doc.get("length") or 0)
+        async for doc in db.fs.files.find({"_id": {"$in": oids}}, {"length": 1})
+    }
+
+
+async def delete_images(file_ids: list[Optional[str]]) -> None:
+    """Best-effort removal of GridFS files that ended up unreferenced
+    (e.g. images stored for a receipt that then turned out to be a
+    duplicate)."""
+    from bson import ObjectId
+    fs = get_fs()
+    for file_id in file_ids:
+        if not file_id:
+            continue
+        try:
+            await fs.delete(ObjectId(file_id))
+        except Exception:
+            pass
 
 
 async def cleanup_orphaned_images() -> int:
